@@ -14,7 +14,7 @@ class ChestXRayDataset(Dataset):
         self.frac = frac
         self.max_pixels = max_pixels
         self.transform = self._get_transform()
-        self.ds = self._get_dataset()
+        self.ds, self.label_names = self._get_dataset()
         
     def _get_transform(self) -> transforms:
         return transforms.Compose([
@@ -27,33 +27,27 @@ class ChestXRayDataset(Dataset):
             )
         ])
         
-    def _get_dataset(self) -> List[dict]:
-        ds = load_dataset("alkzar90/NIH-Chest-X-ray-dataset", "image-classification")
+    def _get_dataset(self) -> Tuple[Dataset, List[str]]:
+        key = "train" if self.is_train else "test"
+        ds = load_dataset("alkzar90/NIH-Chest-X-ray-dataset", "image-classification")[key]
         length = int(len(ds) * self.frac)
         ds = ds.select(range(length)).shuffle(seed=42)
-        size = int(len(ds) * 0.8)
-        train_ds = []
-        test_ds = []
+        size = int(len(ds))
+        final_ds = []
+        label_names = ds.features['labels'].feature.names
         
-        if self.is_train:
-            with tqdm.tqdm(range(size), desc="Preparing train dataset...", colour="green", unit="examples") as pbar:
-                for i in pbar:
-                    image = ds[i]["image"].convert()
-                    if image.size[0] * image.size[1] <= self.max_pixels:
-                        image = self.transform(image)
-                        train_ds.append({"pixels": image, "labels": ds[i]["label_3"]})
-                    else:
-                        print(f"Skipping image {i} due to large size.")
-        else:
-            with tqdm.tqdm(range(size, len(ds)), desc="Preparing test dataset...", colour="green", unit="examples") as pbar:
-                for i in pbar:
-                    image = ds[i]["image"].convert()
-                    if image.size[0] * image.size[1] <= self.max_pixels:
-                        image = self.transform(image)
-                        test_ds.append({"pixels": image, "labels": ds[i]["label_3"]})
-                    else:
-                        print(f"Skipping image {i} due to large size.")
-        return train_ds if self.is_train else test_ds
+        with tqdm.tqdm(range(size), desc=f"Preparing {key} dataset...", colour="green", unit="examples") as pbar:
+            for i in pbar:
+                image = ds[i]["image"].convert()
+                if image.size[0] * image.size[1] <= self.max_pixels:
+                    image = self.transform(image)
+                    label_indices = ds[i]["labels"]
+                    multi_hot_label = torch.zeros(len(label_names), dtype=torch.int64)
+                    multi_hot_label[label_indices] = 1
+                    final_ds.append({"pixels": image, "labels": multi_hot_label})
+                else:
+                    print(f"Skipping image {i} due to large size.")
+        return final_ds, label_names
     
     def __len__(self) -> int:
         return len(self.ds)

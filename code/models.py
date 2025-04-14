@@ -63,7 +63,7 @@ class VisionModelForCLS(torch.nn.Module):
 
         # Reference Model Classifier Head (parameters hat{w}_t)
         self.model.ref_classifier = self._get_classifier_head(self.d, self.c).to(self.device)
-        self.model.ref_classifier.load_state_dict(torch.load(self.ref_classifier_wt_path).to(self.device))
+        # self.model.ref_classifier.load_state_dict(torch.load(self.ref_classifier_wt_path).to(self.device)) # !TODO: Load weights
         
         # Freeze the reference classifier head
         for param in self.model.ref_classifier.parameters():
@@ -108,7 +108,7 @@ class VisionModelForCLS(torch.nn.Module):
             logits[:, i] = layer(hidden_state).squeeze(-1) # Squeeze the last dimension
         # Apply sigmoid to get probabilities m(x; w)
         prob_scores = torch.sigmoid(logits)
-        return prob_scores
+        return prob_scores # (b, c)
 
     def calc_num_params(self) -> None:
         # Check if the requires_grad are set correctly
@@ -119,7 +119,8 @@ class VisionModelForCLS(torch.nn.Module):
             if param.requires_grad:
                 print(f"Trainable: {name} - {param.numel()}")
                 train_params += param.numel()
-        # torchinfo.summary(self.model) # Can be verbose with ModuleList
+        
+        torchinfo.summary(self.model) # Can be verbose with ModuleList
         print(f"Backbone: {self.model_name}")
         print(f"Classifier Head Structure: MLP per label (Example layers: {self.model.classifier[0]})")
         print(f"Number of total parameters: {total_params}")
@@ -129,19 +130,16 @@ class VisionModelForCLS(torch.nn.Module):
         else:
            print("Training Percentage: N/A (total_params is zero)")
 
-
     def _compute_privileged_loss(self,
                                  prob_scores: torch.tensor,
                                  ref_prob_scores: torch.tensor,
                                  labels: torch.tensor) -> torch.tensor:
-        """Computes L_privileged (Eq. 8) averaged over the batch."""
+        """Computes L_privileged averaged over the batch.
+        prob_scores.shape = (b, c), ref_prob_scores.shape = (b, c), labels.shape = (b, c)"""
+        
         batch_size = prob_scores.shape[0]
         total_priv_loss = 0.0
         num_pairs = 0
-
-        # Ensure labels are float for potential BCE loss calculation if needed elsewhere
-        # (though not directly here) and for consistency
-        labels = labels.float()
 
         for i in range(batch_size):
             current_scores_i = prob_scores[i] # Scores for instance i (shape [c])
@@ -150,7 +148,7 @@ class VisionModelForCLS(torch.nn.Module):
 
             # Find positive privileged labels for this instance
             positive_priv_labels = [
-                l for l in self.privileged_indices if labels_i[l] > 0.5 # Use > 0.5 for float labels
+                l for l in self.privileged_indices if labels_i[l] == 1
             ]
 
             for l in positive_priv_labels:
@@ -158,7 +156,7 @@ class VisionModelForCLS(torch.nn.Module):
                 # k is confusing if y_ik = 0 and m(x_i; w_k) >= m(x_i; w_l)
                 confusing_negatives = [
                     k for k in range(self.c)
-                    if labels_i[k] < 0.5 and current_scores_i[k] >= current_scores_i[l]
+                    if labels_i[k] == 0 and current_scores_i[k] >= current_scores_i[l]
                 ]
 
                 for k in confusing_negatives:
@@ -168,7 +166,7 @@ class VisionModelForCLS(torch.nn.Module):
                     ref_m_il = ref_scores_i[l]
                     ref_m_ik = ref_scores_i[k]
 
-                    # Calculate h_w(x_i, l, k) (Eq. 7)
+                    # Calculate h_w(x_i, l, k)
                     log_term_l = torch.log(m_il / (ref_m_il + self.eps) + self.eps)
                     log_term_k = torch.log(m_ik / (ref_m_ik + self.eps) + self.eps)
                     h_w = log_term_l - log_term_k
@@ -192,13 +190,9 @@ class VisionModelForCLS(torch.nn.Module):
                                      prob_scores: torch.tensor,
                                      ref_prob_scores: torch.tensor,
                                      labels: torch.tensor) -> torch.tensor:
-        """Computes L_nonprivileged (Eq. 10) averaged over the batch."""
-        if not self.non_privileged_indices:
-            return torch.tensor(0.0, device=self.device, requires_grad=prob_scores.requires_grad)
-
-        # Ensure labels are float for BCE loss
-        labels = labels.float()
-
+        """Computes L_nonprivileged averaged over the batch.
+        prob_scores.shape = (b, c), ref_prob_scores.shape = (b, c), labels.shape = (b, c)"""
+        
         # Select scores and labels only for non-privileged indices
         non_priv_indices_tensor = torch.tensor(self.non_privileged_indices, device=self.device, dtype=torch.long)
 
@@ -210,26 +204,25 @@ class VisionModelForCLS(torch.nn.Module):
         # Use clamp to prevent log(0) with probabilities from sigmoid
         loss_current = F.binary_cross_entropy(
             m_nonpriv.clamp(min=self.eps, max=1.0-self.eps),
-            y_nonpriv,
+            y_nonpriv.to(torch.float32),
             reduction='none' # Get loss per element
-        )
+        ) # (b, |P_bar|)
 
         # Calculate BCE loss for reference model (element-wise)
         # No gradient needed for reference calculation part
         with torch.no_grad():
              loss_ref = F.binary_cross_entropy(
                  ref_m_nonpriv.clamp(min=self.eps, max=1.0-self.eps),
-                 y_nonpriv,
+                 y_nonpriv.to(torch.float32),
                  reduction='none' # Get loss per element
-             )
+             ) # (b, |P_bar|)
 
-        # Calculate hinge loss (Eq. 10 inner part) element-wise
+        # Calculate hinge loss element-wise
         # max(0, loss(w_j) - loss(hat{w}_j) - epsilon)
-        hinge_loss = torch.relu(loss_current - loss_ref - self.epsilon)
+        hinge_loss = torch.relu(loss_current - loss_ref - self.epsilon) # (b, |P_bar|)
 
         # Average the hinge loss over all batch elements and non-privileged labels
-        avg_non_priv_loss = torch.mean(hinge_loss)
-
+        avg_non_priv_loss = torch.mean(hinge_loss)  # (scalar)
         return avg_non_priv_loss
 
     def _compute_loss(self,
@@ -253,22 +246,16 @@ class VisionModelForCLS(torch.nn.Module):
         pixels.shape = (b, 3, H, W) e.g., (b, 3, 224, 224)
         labels.shape = (b, c) if provided, else None
         """
+        
         # 1. Get hidden state from backbone
         # Ensure pixels is on the right device if not already
-        pixels = pixels.to(self.device, dtype=self.model.vit.embeddings.patch_embeddings.projection.weight.dtype) # Match backbone dtype
+        pixels = pixels.to(self.device) 
 
         # Get hidden states from the frozen backbone
         with torch.no_grad(): # Ensure backbone computation doesn't track gradients
             outputs = self.model.vit(pixel_values=pixels, output_hidden_states=False) # Don't need all hidden states
-            # Use pooler output if available and appropriate, otherwise CLS token
-            if hasattr(self.model, 'pooler') and self.model.pooler is not None:
-                 hidden_state = outputs.pooler_output
-            elif hasattr(outputs, 'last_hidden_state'):
-                 hidden_state = outputs.last_hidden_state[:, 0, :] # CLS token (b, d)
-            else:
-                 # Fallback or specific handling for different model types if needed
-                 raise ValueError("Could not extract final hidden state representation from the model output.")
-
+            hidden_state = outputs.last_hidden_state[:,0,:] # Shape (b, d)
+            
         # Ensure hidden_state is float32 for classifier heads if they expect it
         hidden_state = hidden_state.to(torch.float32) # (b, d)
 
@@ -277,18 +264,20 @@ class VisionModelForCLS(torch.nn.Module):
 
         # 3. Get probability scores from the *reference* classifier head
         with torch.no_grad(): # No gradients needed for reference model
-            ref_prob_scores = self._get_scores(self.ref_classifier, hidden_state) # (b, c)
+            ref_prob_scores = self._get_scores(self.model.ref_classifier, hidden_state) # (b, c)
 
         # 4. Compute loss components if labels are provided
         loss_components = None
         if labels is not None:
             labels = labels.to(self.device) # Ensure labels are on the correct device
             loss_components = self._compute_loss(prob_scores, ref_prob_scores, labels)
+            
+        if self.training and loss_components is None:
+            raise ValueError("Labels must be provided during training to compute loss components.")
 
         # 5. Return results
         # The outer training loop will use loss_components with alpha weights
         return {"outputs": prob_scores, "loss_components": loss_components}
-
 
 def main_cls(model_name: str, device: torch.device) -> None:
     # Example usage
@@ -308,6 +297,7 @@ def main_cls(model_name: str, device: torch.device) -> None:
         device=device,
         model_name=model_name,
         num_labels=num_classes,
+        ref_cls_weights_path="sft_classifier_weights.pth", # Example path
         privileged_indices=PRIVILEGED_INDICES,
         non_privileged_indices=NON_PRIVILEGED_INDICES,
         beta=1.0,      # Example value
@@ -346,16 +336,6 @@ def main_cls(model_name: str, device: torch.device) -> None:
         print("\n--- Loss Components ---")
         print("Privileged Loss:", output_dict["loss_components"]["privileged"].item())
         print("Non-Privileged Loss:", output_dict["loss_components"]["non_privileged"].item())
-
-        # Example of how the outer loop would use these:
-        # Assume alpha_p, alpha_np are managed by the outer loop
-        alpha_p = 0.6 # Example value
-        alpha_np = 0.4 # Example value
-        final_loss = (alpha_p * output_dict["loss_components"]["privileged"] +
-                      alpha_np * output_dict["loss_components"]["non_privileged"])
-        print("\n--- Example Final Weighted Loss (calculated outside model) ---")
-        print("Final Loss:", final_loss.item())
-        # In a real training loop, you would call final_loss.backward()
     else:
         print("\n--- Loss Components ---")
         print("Not computed (labels were None).")
@@ -366,5 +346,4 @@ if __name__ == "__main__":
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using {dev}...")
     # Using a smaller model for potentially faster testing if needed
-    # main_cls("google/vit-base-patch16-224", device=dev)
     main_cls("google/vit-base-patch16-224", device=dev) # Or use the base model
