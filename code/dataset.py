@@ -1,6 +1,6 @@
 from datasets import load_dataset
-import torch, tqdm, os, sys, pickle, datetime, logging, random
-from PIL import Image
+import torch, tqdm, os, sys, pickle, datetime, logging, random, csv
+from PIL import Image, UnidentifiedImageError
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader, Subset
 from typing import Tuple, List, Dict, Optional
@@ -59,7 +59,7 @@ class ChestXRayDataset(Dataset):
         return self.ds[index]
 
 class COCODataset(Dataset):
-    def __init__(self, root_dir: str, frac: float, is_train: bool) -> None:
+    def __init__(self, root_dir: str, frac: float, is_train: bool, privileged_indices_set: set) -> None:
         super().__init__()
         self.root_dir = root_dir
         self.is_train = is_train
@@ -70,7 +70,11 @@ class COCODataset(Dataset):
         self.split_name = "train2014" if self.is_train else "val2014"
         data = self._load_data()
         self.data, self.label_names = data["data"], data["label_names"]
-
+        all_labels = list(range(len(self.label_names)))
+        non_privileged_indices_set = set(all_labels) - privileged_indices_set
+        self.privileged_indices = sorted(list(privileged_indices_set))
+        self.non_privileged_indices = sorted(list(non_privileged_indices_set))
+        
         if not self.data:
             logging.warning(f"No data loaded for the {self.split_name} split. Check paths and dataset integrity.")
 
@@ -182,7 +186,6 @@ class COCODataset(Dataset):
         logging.info(f"Successfully processed {len(processed_data)} samples for {split} split (using {self.frac*100:.1f}% of available data).")
 
         final_data = {"data": processed_data, "label_names": label_names}
-        logging.info(f"Cached processed data to data/coco_{split}.pkl")
         return final_data
 
     def __len__(self) -> int:
@@ -194,9 +197,280 @@ class COCODataset(Dataset):
     def get_label_names(self) -> List[str]:
         return self.label_names
 
+class COCODatasetOnDemand(Dataset):
+    def __init__(
+        self,
+        root_dir: str,
+        frac: float = 1.0,
+        is_train: bool = True,
+        privileged_indices_set: set = None,
+        seed: int = 42,
+        index_dir: Optional[str] = None, # Optional dir for index files
+        force_regenerate: bool = False   # Flag to force index regeneration
+        ) -> None:
+        
+        super().__init__()
+        self.root_dir = Path(root_dir) # Use pathlib for easier path handling
+        self.is_train = is_train
+        self.frac = max(0.0, min(1.0, frac))
+        self.seed = seed
+        self.transform = self._get_transform()
+        self.split_name = "train2014" if self.is_train else "val2014"
+
+        # Handle privileged indices
+        if privileged_indices_set is None:
+            privileged_indices_set = set()
+
+        # Determine index directory
+        if index_dir is None:
+            self.index_dir = self.root_dir / ".index_cache"
+        else:
+            self.index_dir = Path(index_dir)
+        self.index_dir.mkdir(parents=True, exist_ok=True) # Ensure index directory exists
+
+        # Load class names first (needed for num_classes)
+        self.label_names = self._load_label_names()
+        self.num_classes = len(self.label_names)
+
+        # Determine privileged/non-privileged based on loaded names
+        all_labels_set = set(range(self.num_classes))
+        
+        # Ensure provided privileged indices are valid
+        valid_privileged_set = {idx for idx in privileged_indices_set if 0 <= idx < self.num_classes}
+        if len(valid_privileged_set) != len(privileged_indices_set):
+            logging.warning("Some provided privileged indices were out of bounds and ignored.")
+
+        non_privileged_indices_set = all_labels_set - valid_privileged_set
+        self.privileged_indices = sorted(list(valid_privileged_set))
+        self.non_privileged_indices = sorted(list(non_privileged_indices_set))
+        logging.info(f"Privileged Indices: {self.privileged_indices}")
+        logging.info(f"Non-Privileged Indices: {self.non_privileged_indices}")
+
+        # Load or generate index
+        self.index_file_path = self._get_index_filepath()
+        self.index = self._load_or_generate_index(force_regenerate)
+
+        if not self.index:
+             logging.warning(f"No index data loaded for the {self.split_name} split. Check paths and dataset integrity.")
+
+    def _get_transform(self) -> transforms.Compose:
+        # (Same as before)
+        return transforms.Compose([
+            transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+
+    def _load_label_names(self) -> List[str]:
+        """Loads class names from the coco.names file."""
+        names_file = self.root_dir / "coco.names"
+        if not names_file.is_file():
+            raise FileNotFoundError(f"Class names file not found: {names_file}")
+        try:
+            with open(names_file, 'r') as f:
+                label_names = [line.strip() for line in f.readlines() if line.strip()]
+            if not label_names:
+                raise ValueError(f"Class names file is empty: {names_file}")
+            logging.info(f"Loaded {len(label_names)} class names from {names_file}")
+            return label_names
+        except Exception as e:
+            logging.error(f"Error reading class names file {names_file}: {e}")
+            raise
+
+    def _get_index_filepath(self) -> Path:
+        """Generates the path for the index CSV file."""
+        frac_str = f"{self.frac:.4f}".replace('.', 'p')
+        filename = f"coco_idx_{self.split_name}_frac{frac_str}_seed{self.seed}.csv"
+        return self.index_dir / filename
+
+    def _generate_index(self) -> List[Tuple[str, str]]:
+        """Scans directories and creates the list of (image_path, label_path) pairs."""
+        logging.info(f"Generating index file: {self.index_file_path}...")
+        img_dir = self.root_dir / "images" / self.split_name
+        label_dir = self.root_dir / "labels" / self.split_name
+
+        if not img_dir.is_dir():
+            raise FileNotFoundError(f"Image directory not found: {img_dir}")
+        if not label_dir.is_dir():
+             # Allow label dir to be missing, maybe some images have no labels
+             logging.warning(f"Label directory not found: {label_dir}. Images may not have corresponding labels.")
+
+        image_files = [f for f in img_dir.iterdir() if f.is_file() and f.suffix.lower() in ('.png', '.jpg', '.jpeg')]
+        logging.info(f"Found {len(image_files)} potential image files in {img_dir}.")
+
+        index_data = []
+        missing_labels = 0
+        with tqdm.tqdm(image_files, desc=f"Scanning for {self.split_name} files", colour="blue", unit="images") as pbar:
+            for img_path in pbar:
+                base_name = img_path.stem # Get filename without extension
+                label_filename = base_name + ".txt"
+                label_path = label_dir / label_filename
+
+                # Store paths as strings for CSV compatibility
+                img_path_str = str(img_path.resolve())
+                label_path_str = str(label_path.resolve())
+
+                if not label_path.exists():
+                    missing_labels += 1
+                    # Decide whether to include images with missing labels
+                    # Option 1: Include them (label path will be checked in __getitem__)
+                    index_data.append((img_path_str, label_path_str))
+                    # Option 2: Skip them
+                    # continue
+
+                else:
+                    index_data.append((img_path_str, label_path_str))
+
+        if missing_labels > 0:
+            logging.warning(f"{missing_labels} images did not have a corresponding label file in {label_dir}.")
+
+        # Apply shuffling and fraction *before* saving
+        random.seed(self.seed)
+        random.shuffle(index_data)
+        num_samples_to_keep = int(len(index_data) * self.frac)
+        final_index_data = index_data[:num_samples_to_keep]
+
+        logging.info(f"Selected {len(final_index_data)} samples based on frac={self.frac}, seed={self.seed}.")
+
+        # Save to CSV
+        try:
+            with open(self.index_file_path, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['image_path', 'label_path']) # Header
+                writer.writerows(final_index_data)
+            logging.info(f"Successfully saved index to {self.index_file_path}")
+        except IOError as e:
+            logging.error(f"Failed to write index file {self.index_file_path}: {e}")
+            # Decide how to handle write failure - maybe return empty list?
+            return []
+
+        return final_index_data
+
+    def _load_or_generate_index(self, force_regenerate: bool) -> List[Tuple[str, str]]:
+        """Loads index from CSV or generates it if needed."""
+        if not force_regenerate and self.index_file_path.exists():
+            logging.info(f"Loading existing index file: {self.index_file_path}")
+            index_data = []
+            try:
+                with open(self.index_file_path, 'r', newline='') as csvfile:
+                    reader = csv.reader(csvfile)
+                    header = next(reader) # Skip header
+                    if header != ['image_path', 'label_path']:
+                        logging.warning(f"Index file {self.index_file_path} has unexpected header: {header}. Regenerating.")
+                        return self._generate_index()
+                    for row in reader:
+                        if len(row) == 2:
+                            index_data.append((row[0], row[1]))
+                        else:
+                            logging.warning(f"Skipping malformed row in {self.index_file_path}: {row}")
+                logging.info(f"Loaded {len(index_data)} entries from index.")
+                return index_data
+            except (IOError, csv.Error, StopIteration) as e:
+                 logging.warning(f"Failed to load or parse index file {self.index_file_path}: {e}. Regenerating.")
+                 return self._generate_index()
+            except Exception as e:
+                 logging.error(f"Unexpected error loading index file {self.index_file_path}: {e}. Regenerating.")
+                 return self._generate_index()
+
+        else:
+            if force_regenerate:
+                logging.info("Forcing index regeneration.")
+            else:
+                logging.info("Index file not found.")
+            return self._generate_index()
+
+    def __len__(self) -> int:
+        """Returns the number of samples described in the index."""
+        return len(self.index)
+
+    def __getitem__(self, index: int) -> Optional[Dict[str, torch.Tensor]]:
+        """Loads and processes a single sample on demand."""
+        if index >= len(self.index):
+            raise IndexError(f"Index {index} out of bounds for dataset with length {len(self.index)}")
+
+        img_path_str, label_path_str = self.index[index]
+
+        try:
+            # 1. Load Image
+            img = Image.open(img_path_str).convert("RGB")
+
+            # 2. Load Labels
+            unique_class_ids = set()
+            label_path = Path(label_path_str)
+            if label_path.exists():
+                with open(label_path, 'r') as lf:
+                    for line in lf:
+                        parts = line.strip().split()
+                        if len(parts) >= 1:
+                            try:
+                                class_id = int(parts[0])
+                                if 0 <= class_id < self.num_classes:
+                                    unique_class_ids.add(class_id)
+                                # else: Optional: Log invalid class IDs found during getitem
+                            except ValueError:
+                                # Optional: Log lines with non-integer class IDs
+                                pass
+            # else: Image legitimately might not have a label file
+
+            # 3. Apply Transformations
+            transformed_image = self.transform(img)
+
+            # 4. Create multi-hot label vector
+            multi_hot_label = torch.zeros(self.num_classes, dtype=torch.float32)
+            if unique_class_ids:
+                indices = list(unique_class_ids)
+                multi_hot_label[indices] = 1.0
+
+            return {"pixels": transformed_image, "labels": multi_hot_label}
+
+        except FileNotFoundError:
+             logging.error(f"ERROR in __getitem__: Image file not found at {img_path_str} (listed in index). Skipping sample {index}.")
+             # Option 1: Return None (requires collate_fn to handle Nones)
+             # return None
+             # Option 2: Re-raise or raise custom error (might stop training)
+             # raise FileNotFoundError(f"Image file missing: {img_path_str}")
+             # Option 3: Return the *next* valid item (complex, breaks standard Dataset)
+             # For now, we'll log error and let it potentially cause issues downstream if None isn't handled
+             return None # Requires a collate_fn that filters Nones
+        except (UnidentifiedImageError, IOError) as e:
+             logging.error(f"ERROR in __getitem__: Failed to load/read image {img_path_str}: {e}. Skipping sample {index}.")
+             return None # Requires a collate_fn that filters Nones
+        except Exception as e:
+            logging.error(f"ERROR in __getitem__: Unexpected error processing sample {index} ({img_path_str}): {e}")
+            # Optionally re-raise the exception for debugging
+            # raise e
+            return None # Requires a collate_fn that filters Nones
+
+    def get_label_names(self) -> List[str]:
+        """Returns the list of class names."""
+        return self.label_names
+
+# --- Example Usage ---
+
+# Define a collate function that handles None values returned by __getitem__
+def collate_fn_skip_none(batch):
+    """Collate function that filters out None items."""
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        # If all items in the batch were None, return None or an empty structure
+        # depending on what the Trainer expects. Returning None might cause issues.
+        # It might be better to ensure the dataset doesn't produce too many Nones.
+        logging.warning("Entire batch was None after filtering.")
+        # Return dummy batch structure to avoid crashing Trainer, although this isn't ideal
+        return {'pixels': torch.empty(0), 'labels': torch.empty(0)}
+        # return None # This might cause the 'NoneType' error again in Trainer
+
+    # Use default collate on the filtered batch
+    return torch.utils.data.dataloader.default_collate(batch)
+
 if __name__ == '__main__':
     coco_root = "/raid/speech/soumen/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014" # Adjust this path
-    ds = COCODataset(root_dir=coco_root, frac=0.01, is_train=True)
+    # ds = COCODataset(root_dir=coco_root, frac=0.01, is_train=True, privileged_indices_set=set([]))
+    ds = COCODatasetOnDemand(root_dir=coco_root, frac=1.0, is_train=True, privileged_indices_set=set([]))
     print(f"Number of samples in dataset: {len(ds)}")
     print(ds[0])
 
