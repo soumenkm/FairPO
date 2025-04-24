@@ -468,7 +468,7 @@ def collate_fn_skip_none(batch):
     return torch.utils.data.dataloader.default_collate(batch)
 
 if __name__ == '__main__':
-    coco_root = "/raid/speech/soumen/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014" # Adjust this path
+    coco_root = "/home/soumen/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014" # Adjust this path
     # ds = COCODataset(root_dir=coco_root, frac=0.01, is_train=True, privileged_indices_set=set([]))
     ds = COCODatasetOnDemand(root_dir=coco_root, frac=1.0, is_train=True, privileged_indices_set=set([]))
     print(f"Number of samples in dataset: {len(ds)}")

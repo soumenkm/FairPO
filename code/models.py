@@ -2,6 +2,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Union, List, Set
+import copy
 
 import torchinfo
 import torch
@@ -57,7 +58,15 @@ class VisionModelForCLS(torch.nn.Module):
             # Reference Model Classifier Head (parameters hat{w}_t)
             self.model.ref_classifier = self._get_classifier_head(self.d, self.c).to(self.device)
             if self.ref_cls_wt_path is not None:
-                self.model.ref_classifier.load_state_dict(torch.load(self.ref_classifier_wt_path).to(self.device)) # !TODO: Load ref model weights
+                ref_cls_state_dict = torch.load(self.ref_cls_wt_path, map_location=self.device)
+                ref_cls_state_dict_new = copy.deepcopy(ref_cls_state_dict)
+                ref_cls_state_dict_new["model_state"] = {}
+                for k, v in ref_cls_state_dict["model_state"].items():
+                    # Replace "classifier." with "ref_classifier." in the state dict keys
+                    if "classifier." in k:
+                        k = k.replace("classifier.", "ref_classifier.")
+                    ref_cls_state_dict_new["model_state"][k] = v
+                self.load_state_dict(ref_cls_state_dict_new["model_state"], strict=False) # !TODO: Load ref model weights
             else:
                 print("WARNING: Reference classifier weights are NOT loaded. Using initialized weights.")
             # Freeze the reference classifier head
