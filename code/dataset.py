@@ -207,7 +207,7 @@ class COCODatasetOnDemand(Dataset):
         seed: int = 42,
         index_dir: Optional[str] = None, # Optional dir for index files
         force_regenerate: bool = False   # Flag to force index regeneration
-        ) -> None:
+    ) -> None:
         
         super().__init__()
         self.root_dir = Path(root_dir) # Use pathlib for easier path handling

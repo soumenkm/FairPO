@@ -53,22 +53,23 @@ class VisionModelForCLS(torch.nn.Module):
         
         # Trainable classifier head (parameters w_t)
         self.model.classifier = self._get_classifier_head(self.d, self.c).to(self.device)
-            
+        
         if not self.is_ref:
             # Reference Model Classifier Head (parameters hat{w}_t)
             self.model.ref_classifier = self._get_classifier_head(self.d, self.c).to(self.device)
             if self.ref_cls_wt_path is not None:
                 ref_cls_state_dict = torch.load(self.ref_cls_wt_path, map_location=self.device)
-                ref_cls_state_dict_new = copy.deepcopy(ref_cls_state_dict)
-                ref_cls_state_dict_new["model_state"] = {}
+                ref_cls_state_dict_new = {}
                 for k, v in ref_cls_state_dict["model_state"].items():
                     # Replace "classifier." with "ref_classifier." in the state dict keys
-                    if "classifier." in k:
-                        k = k.replace("classifier.", "ref_classifier.")
-                    ref_cls_state_dict_new["model_state"][k] = v
-                self.load_state_dict(ref_cls_state_dict_new["model_state"], strict=False) # !TODO: Load ref model weights
+                    if "model.classifier." in k:
+                        k = k.replace("model.classifier.", "")
+                        ref_cls_state_dict_new[k] = v
+                self.model.ref_classifier.load_state_dict(ref_cls_state_dict_new, strict=True) 
+                print(f"INFO: Reference classifier weights loaded from {self.ref_cls_wt_path}")
             else:
                 print("WARNING: Reference classifier weights are NOT loaded. Using initialized weights.")
+            
             # Freeze the reference classifier head
             for param in self.model.ref_classifier.parameters():
                 param.requires_grad = False
@@ -123,7 +124,8 @@ class VisionModelForCLS(torch.nn.Module):
             if param.requires_grad:
                 train_params += param.numel()
         
-        torchinfo.summary(self.model) # Can be verbose with ModuleList
+        print(self)
+        # torchinfo.summary(self.model) # Can be verbose with ModuleList
         print(f"Backbone: {self.model_name}")
         print(f"Number of total parameters: {total_params}")
         print(f"Number of trainable parameters (classifier heads): {train_params}")
@@ -258,7 +260,8 @@ class VisionModelForCLS(torch.nn.Module):
             loss_non_privileged = self._compute_non_privileged_loss(prob_scores, ref_prob_scores, labels)
             return {
                 "privileged": loss_privileged,
-                "non_privileged": loss_non_privileged
+                "non_privileged": loss_non_privileged,
+                "loss": loss_privileged + loss_non_privileged
             }
         else:
             loss_ref_model = self._compute_ref_model_loss(prob_scores, labels)
@@ -378,11 +381,10 @@ def main_cls(model_name: str, device: torch.device) -> None:
             bnb_4bit_use_double_quant=True,
     ) if torch.cuda.is_available() else None # Only use quantization if CUDA is available
 
-    num_classes = 14
+    num_classes = 80
     # Assume these are defined based on your specific task
-    # Example: For NIH Chest X-ray14 with 14 labels
-    ALL_LABELS = list(range(14))
-    PRIVILEGED_INDICES_SET = {0, 5, 10} # Example: Indices of 'Mass', 'Pneumothorax', etc.
+    ALL_LABELS = list(range(80))
+    PRIVILEGED_INDICES_SET = set(list(range(20))) 
     NON_PRIVILEGED_INDICES_SET = set(ALL_LABELS) - PRIVILEGED_INDICES_SET
 
     # Convert sets to lists/tensors for easier indexing if needed
@@ -396,7 +398,7 @@ def main_cls(model_name: str, device: torch.device) -> None:
         device=device,
         model_name=model_name,
         num_labels=num_classes,
-        ref_cls_weights_path=None, # "sft_classifier_weights.pth", # Example path
+        ref_cls_weights_path="output/ckpt/fairpo_ref_model_finetune_vit-base-patch16-224/ref_model_1.00_5.0e-05/ckpt_ep_latest.pth", # "sft_classifier_weights.pth", # Example path
         privileged_indices=PRIVILEGED_INDICES,
         non_privileged_indices=NON_PRIVILEGED_INDICES,
         beta=1.0,      # Example value
@@ -404,16 +406,6 @@ def main_cls(model_name: str, device: torch.device) -> None:
         is_ref=False,  # Set to True for reference model
         quant_config=quant_config
     ).to(device)
-
-    # TODO: --- !!! IMPORTANT !!! ---
-    # Load your SFT classifier weights into model.ref_classifier here
-    # Example (replace with actual loading):
-    # try:
-    #     model.ref_classifier.load_state_dict(torch.load('sft_classifier_weights.pth', map_location=device))
-    #     print("Loaded reference classifier weights.")
-    # except FileNotFoundError:
-    #     print("WARNING: sft_classifier_weights.pth not found. Reference model uses initial weights.")
-    # --------------------------
 
     model.calc_num_params()
 
