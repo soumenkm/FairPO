@@ -12,7 +12,7 @@ import time
 import sys
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 # Import necessary components from other files
 from models import VisionModelForCLS 
@@ -41,14 +41,10 @@ class ModelTrainer:
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- Setup WandB ---
-        self._setup_wandb() # Initializes wandb if enabled
-
         # --- Load Data ---
         logging.info("Loading datasets...")
         
         # Define privileged indices based on config
-        all_labels = list(range(self.train_dataset.num_classes)) 
         privileged_indices_set = set(map(int, config.privileged_indices.split(',')))
        
         self.train_dataset = COCODatasetOnDemand(
@@ -121,6 +117,9 @@ class ModelTrainer:
 
         # --- Checkpoint Setup (moved earlier) ---
         self.start_epoch = 0
+        
+        # --- Setup WandB ---
+        self._setup_wandb() # Initializes wandb if enabled
 
     def _calculate_norm(self, model_params, norm_type=2.0):
         """Calculates the total norm for a list of parameters."""
@@ -295,7 +294,7 @@ class ModelTrainer:
                     'loss': batch_log_payload.get('train/combined_loss', batch_log_payload.get('train/sft_loss', 0.0)),
                     'acc': batch_log_payload.get('train/accuracy_overall', 0.0),
                     'gnorm': batch_log_payload.get('train/grad_norm', 0.0),
-                    'step': self.global_step
+                    'step': self.train_step
                 }
                 if not self.config.is_ref_training:
                     tqdm_postfix['alpha_p'] = batch_log_payload.get('train/alpha_p', 0.0)
@@ -397,11 +396,17 @@ class ModelTrainer:
 def main():
     parser = argparse.ArgumentParser(description="Train/Test FairPO Model for Multi-Label Classification")
 
+    if "raid" in str(Path.cwd()):
+        user_dir = "/raid/speech/soumen"
+    else:
+        user_dir = "home/soumen"
+    current_dir = Path.cwd()
+    
     # Paths
-    parser.add_argument('--coco_root', type=str, default="/home/soumen/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014", help='Root directory of the COCO dataset') # CHANGE THIS
+    parser.add_argument('--coco_root', type=str, default=f"{user_dir}/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014", help='Root directory of the COCO dataset') # CHANGE THIS
     parser.add_argument('--index_dir', type=str, default=None, help='Directory for dataset index files (default: coco_root/.index_cache)')
     parser.add_argument('--checkpoint_dir', type=str, default='./output/ckpt/fairpo_model', help='Directory to save checkpoints')
-    parser.add_argument('--ref_cls_weights_path', type=str, default="/home/soumen/OML/FairPO/output/ckpt/ref_model/ckpt_ep_latest.pth", help='Path to SFT pre-trained reference classifier weights (REQUIRED for FairPO training/testing)') # Make default None
+    parser.add_argument('--ref_cls_weights_path', type=str, default=f"{current_dir}/output/ckpt/ref_model/ckpt_ep_latest.pth", help='Path to SFT pre-trained reference classifier weights (REQUIRED for FairPO training/testing)') # Make default None
 
     # Model & Data
     parser.add_argument('--model_name', type=str, default='google/vit-base-patch16-224', help='Vision Transformer model name')
@@ -416,7 +421,7 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=5e-5, help='Optimizer learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.1, help='Optimizer weight decay')
     parser.add_argument('--beta', type=float, default=2.0, help='DPO beta hyperparameter')
-    parser.add_argument('--epsilon', type=float, default=0.1, help='Constraint slack epsilon')
+    parser.add_argument('--epsilon', type=float, default=0, help='Constraint slack epsilon')
     parser.add_argument('--eta_alpha', type=float, default=0.0001, help='Learning rate for GRPO alpha weights')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value (0 to disable)')
 
