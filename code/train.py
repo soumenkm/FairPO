@@ -8,8 +8,9 @@ from dataset import COCODatasetOnDemand
 from models import VisionModelForCLS
 import numpy as np
 from typing import List, Tuple, Union, Any
+
 if __name__ == "__main__": # Commented out for execution in interactive env
-    os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
 class ModelTrainer:
     def __init__(self, device: torch.device, config: dict):
@@ -25,26 +26,28 @@ class ModelTrainer:
         self.batch_size = self.config["batch_size"]
         self.num_epochs = self.config["num_epochs"]
         self.num_steps = len(self.train_ds)//(self.batch_size)
-        self.project_name = self.config["project_name"] + f"_{self.model_name_srt}"
         self.ft = self.config['finetune_module']
+        self.project_name = "fairpo_" + self.ft + "_finetune_" + self.model_name_srt
         self.wandb_log = self.config["wandb_log"]
+        self.run_name = f"{self.ft}_{self.config['frac']:.2f}_{self.config['initial_lr']:.1e}"
+  
+        self.model = VisionModelForCLS(
+            device=device,
+            model_name=self.model_name,
+            num_labels=len(self.train_ds.label_names),
+            ref_cls_weights_path=None if self.ft == "ref_model" else str(Path.cwd() / self.config["ref_cls_weights_path"]),
+            privileged_indices=self.train_ds.privileged_indices,
+            non_privileged_indices=self.train_ds.non_privileged_indices,
+            beta=self.config["beta"],      # Example value
+            epsilon=self.config["epsilon"],   # Example value
+            is_ref=True if self.ft == "ref_model" else False,  # Set to True for reference model
+            quant_config=None
+        ).to(device)
         
-        if self.ft == "ref_model":
-            self.run_name = f"{self.ft}_{self.config['frac']:.2f}_{self.config['initial_lr']:.1e}"
-            self.model = VisionModelForCLS(
-                device=device,
-                model_name=self.model_name,
-                num_labels=len(self.train_ds.label_names),
-                ref_cls_weights_path=None,
-                privileged_indices=self.train_ds.privileged_indices,
-                non_privileged_indices=self.train_ds.non_privileged_indices,
-                beta=self.config["beta"],      # Example value
-                epsilon=self.config["epsilon"],   # Example value
-                is_ref=True,  # Set to True for reference model
-                quant_config=None
-            ).to(device)
-        else:
-            raise ValueError("Invalid finetune module!")
+        # --- GRPO Alpha Weights (only for FairPO training) ---
+        if not self.ft == "ref_model":
+            self.alpha_priv = torch.tensor(0.5, device=self.device)
+            self.alpha_non_priv = torch.tensor(0.5, device=self.device)
             
         self.checkpoint_dir = Path(f"output/ckpt/{self.project_name}/{self.run_name}")
         self.optimizer = torch.optim.AdamW(params=self.model.parameters(), lr=self.config['initial_lr'], weight_decay=self.config["weight_decay"], betas=self.config["adam_betas"])
@@ -88,9 +91,25 @@ class ModelTrainer:
                 out = self.model(pixels, labels)
         return out
     
-    def _optimize_batch(self, batch: dict, ep: int, batch_index: int) -> Tuple[float]:  
+    def _get_mirror_loss(self, out: dict) -> Tuple[float]:
+        priv_loss = out["loss"]["privileged"]
+        non_priv_loss = out["loss"]["non_privileged"]
+        
+        # Mirror Ascent Step
+        with torch.no_grad():
+            self.alpha_priv = self.alpha_priv * torch.exp(self.config["lr_grpo_alpha"] * priv_loss)
+            self.alpha_non_priv = self.alpha_non_priv * torch.exp(self.config["lr_grpo_alpha"] * non_priv_loss)
+            Z = self.alpha_priv + self.alpha_non_priv + 1e-8 # Add epsilon for stability
+            self.alpha_priv = self.alpha_priv / Z
+            self.alpha_non_priv = self.alpha_non_priv / Z  
+            
+        # Mirror Descent Step  
+        total_loss = self.alpha_priv * priv_loss + self.alpha_non_priv * non_priv_loss 
+        return total_loss
+    
+    def _optimize_batch(self, batch: dict, ep: int, batch_index: int) -> dict:  
         out = self._forward_batch(batch, is_train=True)
-        loss = out["loss"]["loss"]
+        loss = out["loss"]["loss"] if self.ft == "ref_model" else self._get_mirror_loss(out)
         acc = out["acc"]["acc"]
         loss.backward()     
         gn = self._find_norm(True) 
@@ -101,27 +120,43 @@ class ModelTrainer:
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         self.scheduler.step(ep + batch_index/len(self.train_dl))
-        return loss.item(), acc, gn, pn, lr
+        
+        if self.ft == "ref_model":
+            return {"loss": loss.item(), "acc": acc, "gn": gn, "pn": pn, "lr": lr} 
+        else:
+            priv_loss = out["loss"]["privileged"]
+            non_priv_loss = out["loss"]["non_privileged"]
+            return {"loss": loss.item(), "acc": acc, "gn": gn, "pn": pn, "lr": lr, "priv_loss": priv_loss.item(), "non_priv_loss": non_priv_loss.item()}
 
     def _optimize_dataloader(self, ep: int) -> None:  
         with tqdm.tqdm(iterable=self.train_dl, desc=f"[TRAIN] ep: {ep}/{self.num_epochs-1}", total=len(self.train_dl), unit="step", colour="green") as pbar:
             for i, batch in enumerate(pbar):    
-                loss, acc, gn, pn, lr = self._optimize_batch(batch=batch, ep=ep, batch_index=i)
+                out = self._optimize_batch(batch=batch, ep=ep, batch_index=i)
                 if self.wandb_log:
-                    wandb.log({"train/loss": loss, "train/accuracy": acc, "train/learning_rate": lr, "train/grad_norm": gn, "train/param_norm": pn, "train/epoch": ep, "train/step": self.train_step})
-                    self.train_step += 1
-                pbar.set_postfix({"loss": f"{loss:.3f}", "acc": f"{acc:.3f}", "lr": f"{lr:.3e}"})                        
+                    log_dict = {"train/loss": out["loss"], "train/accuracy": out["acc"], "train/learning_rate": out["lr"], "train/grad_norm": out["gn"], "train/param_norm": out["pn"], "train/epoch": ep, "train/step": self.train_step}
+                    if self.ft == "ref_model":
+                        wandb.log(log_dict)
+                    else: 
+                        log_dict.update({"train/priv_loss": out["priv_loss"], "train/non_priv_loss": out["non_priv_loss"], "train/priv_alpha": self.alpha_priv.item(), "train/non_priv_alpha": self.alpha_non_priv.item()})
+                        wandb.log(log_dict)
+                    self.train_step += 1    
+                pbar.set_postfix({"loss": f"{out['loss']:.3f}", "acc": f"{out['acc']:.3f}", "lr": f"{out['lr']:.3e}"})                        
     
     def _validate_dataloader(self, ep: int) -> None:
         with tqdm.tqdm(iterable=self.eval_dl, desc=f"[VAL] ep: {ep}/{self.num_epochs-1}", total=len(self.eval_dl), unit="step", colour="green") as pbar:
             for i, batch in enumerate(pbar):    
                 out = self._forward_batch(batch=batch, is_train=False) 
-                loss = out["loss"]["loss"]
+                loss = out["loss"]
                 acc = out["acc"]["acc"]
+                log_dict = {"val/accuracy": acc, "val/epoch": ep, "val/step": self.val_step}
                 if self.wandb_log:
-                    wandb.log({"val/loss": loss, "val/accuracy": acc, "val/epoch": ep, "val/step": self.val_step})
+                    if self.ft == "ref_model":
+                        wandb.log(log_dict.update({"val/loss": loss["loss"].item()}))
+                    else:
+                        log_dict.update({"val/loss": loss["loss"].item(), "val/priv_loss": loss["privileged"].item(), "val/non_priv_loss": loss["non_privileged"].item()})
+                        wandb.log(log_dict)
                     self.val_step += 1
-                pbar.set_postfix({"loss": f"{loss:.3f}", "acc": f"{acc:.3f}"})  
+                pbar.set_postfix({"loss": f"{loss['loss']:.3f}", "acc": f"{acc:.3f}"})  
     
     def _save_checkpoint(self, ep: int, is_latest_ckpt: bool) -> None:
         checkpoint = {"epoch": ep, 
@@ -158,17 +193,17 @@ class ModelTrainer:
 def main(device: torch.device) -> None:
     config = {
         "model_name": "google/vit-base-patch16-224",
-        "finetune_module": "ref_model",
+        "finetune_module": "priv_model", # Options: ref_model, priv_model
         "root_dir": "/raid/speech/soumen/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014",
-        "project_name": "fairpo_ref_model_finetune",
-        "ref_cls_weights_path": None,
-        "privileged_indices_set": None, # Set of privileged indices
+        "ref_cls_weights_path": "output/ckpt/fairpo_ref_model_finetune_vit-base-patch16-224/ref_model_1.00_5.0e-05/ckpt_ep_latest.pth", # Path to reference model checkpoint
+        "privileged_indices_set": set(list(range(20))), # Set of privileged indices
         "beta": 1.0, # DPO beta
         "epsilon": 0.1, # non privileged loss margin
         "num_epochs": 10,
         "batch_size": 16,
-        "frac": 1.0,
+        "frac": 1.00,
         "initial_lr": 5e-5,
+        "lr_grpo_alpha": 0.1,
         "max_grad_norm": 10.0,
         "weight_decay": 0.1,
         "adam_betas": (0.95, 0.999),
