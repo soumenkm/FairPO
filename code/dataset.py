@@ -215,7 +215,7 @@ class COCODatasetOnDemand(Dataset):
         self.frac = max(0.0, min(1.0, frac))
         self.seed = seed
         self.transform = self._get_transform()
-        self.split_name = "train2014" if self.is_train else "val2014"
+        self.split_name = "train2014" if self.is_train else "test2014"
 
         # Handle privileged indices
         if privileged_indices_set is None:
