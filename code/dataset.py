@@ -201,8 +201,8 @@ class COCODatasetOnDemand(Dataset):
     def __init__(
         self,
         root_dir: str,
+        split_name: str,
         frac: float = 1.0,
-        is_train: bool = True,
         privileged_indices_set: set = None,
         seed: int = 42,
         index_dir: Optional[str] = None, # Optional dir for index files
@@ -211,11 +211,17 @@ class COCODatasetOnDemand(Dataset):
         
         super().__init__()
         self.root_dir = Path(root_dir) # Use pathlib for easier path handling
-        self.is_train = is_train
         self.frac = max(0.0, min(1.0, frac))
         self.seed = seed
         self.transform = self._get_transform()
-        self.split_name = "train2014" if self.is_train else "test2014"
+        if split_name == "train":
+            self.split_name = "train2014" 
+        elif split_name == "val":
+            self.split_name = "val2014"
+        elif split_name == "test":
+            self.split_name = "test2014"
+        else:
+            raise ValueError(f"Invalid split name: {split_name}. Use 'train', 'val', or 'test'.")
 
         # Handle privileged indices
         if privileged_indices_set is None:
