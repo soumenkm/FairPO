@@ -242,7 +242,7 @@ def main():
     default_coco_root = f"{user_dir}/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014"
 
     # --- Required Argument ---
-    parser.add_argument('--checkpoint_path', type=str, default="output/ckpt/fairpo_model/FairPO-train/FairPO_lr5e-05_eta0.0001_eps0.05_beta2.0/checkpoint_epoch_1.pth", help='Path to the model checkpoint file to test')
+    parser.add_argument('--checkpoint_path', type=str, default="output/ckpt/fairpo_model/FairPO-train/FairPO_ep5_lr5e-05_eta0.0001_eps0.1_beta2.0/checkpoint_epoch_2.pth", help='Path to the model checkpoint file to test')
 
     # --- Essential CLI Arguments for Test Setup ---
     parser.add_argument('--coco_root', type=str, default=default_coco_root, help='Root directory of the COCO dataset (may override checkpoint config if needed)')

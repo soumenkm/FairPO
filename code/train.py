@@ -315,7 +315,8 @@ class ModelTrainer:
             # Log Validation Metrics (against val/step)
             val_metrics["val/step"] = self.val_step # Add the val step
             val_metrics["epoch"] = epoch + 1 # Also log epoch for reference
-            wandb.log(val_metrics) # Log val metrics (uses val/step)
+            if self.config.is_wandb:
+                wandb.log(val_metrics) # Log val metrics (uses val/step)
 
             # --- Checkpointing ---
             self._save_checkpoint(epoch, is_best=False)
@@ -392,7 +393,7 @@ class ModelTrainer:
         return avg_val_metrics
 
 def main():
-    parser = argparse.ArgumentParser(description="Train/Test FairPO Model for Multi-Label Classification")
+    parser = argparse.ArgumentParser(description="Train FairPO Model for Multi-Label Classification")
 
     if "raid" in str(Path.cwd()):
         user_dir = "/raid/speech/soumen"
@@ -401,10 +402,11 @@ def main():
     current_dir = Path.cwd()
     
     # Paths
+    ref_cls_weights_path = None # f"{current_dir}/output/ckpt/ref_model/ckpt_ep_latest.pth"
     parser.add_argument('--coco_root', type=str, default=f"{user_dir}/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014", help='Root directory of the COCO dataset') # CHANGE THIS
     parser.add_argument('--index_dir', type=str, default=None, help='Directory for dataset index files (default: coco_root/.index_cache)')
     parser.add_argument('--checkpoint_dir', type=str, default='./output/ckpt/fairpo_model', help='Directory to save checkpoints')
-    parser.add_argument('--ref_cls_weights_path', type=str, default=f"{current_dir}/output/ckpt/ref_model/ckpt_ep_latest.pth", help='Path to SFT pre-trained reference classifier weights (REQUIRED for FairPO training/testing)') # Make default None
+    parser.add_argument('--ref_cls_weights_path', type=str, default=ref_cls_weights_path, help='Path to SFT pre-trained reference classifier weights (REQUIRED for FairPO training/testing)') # Make default None
 
     # Model & Data
     parser.add_argument('--model_name', type=str, default='google/vit-base-patch16-224', help='Vision Transformer model name')
@@ -414,17 +416,17 @@ def main():
     parser.add_argument('--force_regenerate_index', default=False, help='Force regeneration of dataset index')
 
     # Training Hyperparameters
-    parser.add_argument('--epochs', type=int, default=25, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=16, help='Training batch size')
     parser.add_argument('--learning_rate', type=float, default=5e-5, help='Optimizer learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.1, help='Optimizer weight decay')
     parser.add_argument('--beta', type=float, default=2.0, help='DPO beta hyperparameter')
-    parser.add_argument('--epsilon', type=float, default=0.05, help='Constraint slack epsilon')
+    parser.add_argument('--epsilon', type=float, default=0.1, help='Constraint slack epsilon')
     parser.add_argument('--eta_alpha', type=float, default=0.0001, help='Learning rate for GRPO alpha weights')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value (0 to disable)')
 
     # Training Mode
-    parser.add_argument('--is_ref_training', default=False, help='Train the reference model (SFT) only.')
+    parser.add_argument('--is_ref_training', default=True, help='Train the reference model (SFT) only.')
 
     # System
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
@@ -444,7 +446,7 @@ def main():
         eta_str = f"_eta{args.eta_alpha}" if not args.is_ref_training else ""
         eps_str = f"_eps{args.epsilon}" if not args.is_ref_training else ""
         beta_str = f"_beta{args.beta}" if not args.is_ref_training else ""
-        args.run_name = f"{mode}_lr{lr}{eta_str}{eps_str}{beta_str}"
+        args.run_name = f"{mode}_frac{args.train_frac}_ep{args.epochs}_lr{lr}{eta_str}{eps_str}{beta_str}"
         logging.info(f"Generated WandB run name: {args.run_name}")
   
     # Set default index_dir if None

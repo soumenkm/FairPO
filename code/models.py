@@ -81,6 +81,10 @@ class VisionModelForCLS(torch.nn.Module):
         # Ensure trainable classifier head parameters require gradients
         for param in self.model.classifier.parameters():
             param.requires_grad = True
+            
+        if self.is_ref:
+            for param in self.model.vit.encoder.layer[-1].parameters():
+                param.requires_grad = True
 
     def _get_classifier_head(self, d: int, num_labels: int) -> torch.nn.Module:
         # Creates a ModuleList containing one MLP per label
