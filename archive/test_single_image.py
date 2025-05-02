@@ -49,7 +49,7 @@ def predict_single_image(args):
     logging.info("Configuration loaded from checkpoint.")
     # Log the essential config loaded
     logging.info(f"  Model Name: {config.model_name}")
-    logging.info(f"  Num Labels (expected): {config.num_labels}")
+    # logging.info(f"  Num Labels (expected): {config.num_labels}")
     logging.info(f"  Is Ref Training: {config.is_ref_training}")
 
     # --- Get Label Names (Workaround) ---
