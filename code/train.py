@@ -1,3 +1,4 @@
+# train.py
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -10,14 +11,14 @@ from tqdm import tqdm
 import numpy as np
 import time
 import sys
+from typing import Dict, Any, Tuple, Optional # Added for type hinting
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "7" # Example default
 
 # Import necessary components from other files
-from models import VisionModelForCLS 
-# Use the OnDemand version for memory efficiency
-from dataset import COCODatasetOnDemand, collate_fn_skip_none 
+from models import VisionModelForCLS
+from dataset import COCODatasetOnDemand, collate_fn_skip_none
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -30,32 +31,40 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
 class ModelTrainer:
+    # --- __init__ remains the same as your provided version ---
     def __init__(self, config):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() and not config.cpu else "cpu")
         logging.info(f"Using device: {self.device}")
-        self.train_step = 0 # Initialize train step counter
-        self.val_step = 0 # Initialize validation step counter
+        self.train_step = 0
+        self.val_step = 0
+        self.start_epoch = 0 # Added for potential checkpoint loading logic later
 
-        # --- Checkpoint Setup FIRST (needed for wandb potentially) ---
-        self.checkpoint_dir = Path(config.checkpoint_dir) / self.config.wandb_project / self.config.run_name
+        # Create checkpoint dir structure based on project/run name
+        run_name = self._get_run_name() # Get run name early
+        self.config.run_name = run_name # Store it back in config
+        self.checkpoint_dir = Path(config.checkpoint_dir) / config.wandb_project / run_name
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"Checkpoints will be saved in: {self.checkpoint_dir}")
 
-        # --- Load Data ---
         logging.info("Loading datasets...")
-        
-        # Define privileged indices based on config
-        privileged_indices_set = set(map(int, config.privileged_indices.split(',')))
-       
+        privileged_indices_set = set(map(int, config.privileged_indices.split(','))) if config.privileged_indices else set()
+
+        # Setup index dir path correctly
+        index_dir_path = Path(config.index_dir) if config.index_dir else Path(config.coco_root) / '.index_cache'
+        index_dir_path.mkdir(parents=True, exist_ok=True)
+        logging.info(f"Using index directory: {index_dir_path}")
+        self.config.index_dir = index_dir_path # Update config with resolved path
+
         self.train_dataset = COCODatasetOnDemand(
             root_dir=config.coco_root, frac=config.train_frac, split_name="train",
             privileged_indices_set=privileged_indices_set, seed=seed,
-            index_dir=config.index_dir, force_regenerate=config.force_regenerate_index
+            index_dir=self.config.index_dir, force_regenerate=config.force_regenerate_index
         )
         self.val_dataset = COCODatasetOnDemand(
             root_dir=config.coco_root, frac=config.val_frac, split_name="val",
             privileged_indices_set=privileged_indices_set, seed=seed,
-            index_dir=config.index_dir, force_regenerate=config.force_regenerate_index
+            index_dir=self.config.index_dir, force_regenerate=config.force_regenerate_index
         )
 
         self.label_names = self.train_dataset.get_label_names()
@@ -68,7 +77,6 @@ class ModelTrainer:
         logging.info(f"Privileged Indices: {self.privileged_indices}")
         logging.info(f"Non-Privileged Indices: {self.non_privileged_indices}")
 
-        # --- Create DataLoaders ---
         self.train_loader = DataLoader(
             self.train_dataset, batch_size=config.batch_size, shuffle=True,
             num_workers=config.num_workers, pin_memory=torch.cuda.is_available(), collate_fn=collate_fn_skip_none
@@ -78,355 +86,538 @@ class ModelTrainer:
             num_workers=config.num_workers, pin_memory=torch.cuda.is_available(), collate_fn=collate_fn_skip_none
         )
 
-        # --- Initialize Model ---
         logging.info(f"Initializing model: {config.model_name}")
         ref_weights_path = Path(config.ref_cls_weights_path) if config.ref_cls_weights_path else None
+        # Check reference weights path ONLY IF not training the reference model
         if not config.is_ref_training:
             if ref_weights_path is None or not ref_weights_path.is_file():
-                logging.error(f"Reference weights not found at '{config.ref_cls_weights_path}'. Required for FairPO.")
+                logging.error(f"Reference weights REQUIRED but not found at '{config.ref_cls_weights_path}' for FairPO training.")
                 sys.exit(1)
-            logging.info(f"Found reference classifier weights at: {ref_weights_path}")
+            logging.info(f"Found reference classifier weights for FairPO: {ref_weights_path}")
+        elif ref_weights_path and ref_weights_path.is_file():
+             # If training ref model, but path is given, warn but proceed (don't load it)
+             logging.warning(f"Reference weights path '{ref_weights_path}' provided, but ignored as --is_ref_training is True.")
+             ref_weights_path = None # Ensure it's not passed to VisionModelForCLS
 
+        # Pass loss_type from config to model __init__
         self.model = VisionModelForCLS(
             device=self.device, model_name=config.model_name, num_labels=self.num_labels,
             ref_cls_weights_path=str(ref_weights_path) if ref_weights_path else None,
             privileged_indices=self.privileged_indices, non_privileged_indices=self.non_privileged_indices,
-            is_ref=config.is_ref_training, beta=config.beta, epsilon=config.epsilon,
-            quant_config=None 
+            is_ref=config.is_ref_training,
+            loss_type=getattr(config, 'loss_type', None), # Use getattr for safety if loss_type not in older configs
+            beta=config.beta, epsilon=config.epsilon,
+            quant_config=None
         ).to(self.device)
 
         self.model.calc_num_params()
 
-        # --- Optimizer ---
-        # Filter parameters that require gradients (only the classifier head)
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        if not trainable_params:
-            logging.error("No trainable parameters found in the model. Check model definition and requires_grad flags.")
+        self.trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not self.trainable_params:
+            logging.error("No trainable parameters found!")
             sys.exit(1)
-        logging.info(f"Found {sum(p.numel() for p in trainable_params)} trainable parameters.")
+        logging.info(f"Found {sum(p.numel() for p in self.trainable_params):,} trainable parameters.")
 
         self.optimizer = optim.AdamW(
-            trainable_params, # Pass only trainable parameters
-            lr=config.learning_rate, weight_decay=config.weight_decay
+            self.trainable_params, lr=config.learning_rate, weight_decay=config.weight_decay
         )
 
-        # --- GRPO Alpha Weights (only for FairPO training) ---
         if not config.is_ref_training:
             self.alpha_privileged = torch.tensor(0.5, device=self.device)
             self.alpha_non_privileged = torch.tensor(0.5, device=self.device)
 
-        # --- Checkpoint Setup (moved earlier) ---
-        self.start_epoch = 0
-        
-        # --- Setup WandB ---
-        self._setup_wandb() # Initializes wandb if enabled
+        self._setup_wandb()
 
+    # --- Norm Calculation Helpers (Unchanged) ---
     def _calculate_norm(self, model_params, norm_type=2.0):
-        """Calculates the total norm for a list of parameters."""
         total_norm = torch.tensor(0.0, device=self.device)
         for p in model_params:
-            param_norm = p.norm(norm_type)
-            total_norm += param_norm.item() ** norm_type
+            if p is not None: # Added check for None params
+                 param_norm = p.norm(norm_type)
+                 total_norm += param_norm.item() ** norm_type
         total_norm = total_norm ** (1. / norm_type)
         return total_norm
 
     def _calculate_grad_norm(self, model_params, norm_type=2.0):
-        """Calculates the total norm for gradients of model parameters."""
         total_norm = torch.tensor(0.0, device=self.device)
-        params_to_norm = [p for p in model_params if p.grad is not None]
-        if not params_to_norm:
-            return total_norm # Return 0 if no gradients
+        params_to_norm = [p for p in model_params if p is not None and p.grad is not None] # Added check
+        if not params_to_norm: return total_norm
         for p in params_to_norm:
              param_norm = p.grad.data.norm(norm_type)
              total_norm += param_norm.item() ** norm_type
         total_norm = total_norm ** (1. / norm_type)
         return total_norm
 
+    # --- WandB Setup Helper (Unchanged) ---
     def _setup_wandb(self):
         if self.config.is_wandb:
-            wandb.init(
-                project=self.config.wandb_project, # Use wandb_project here
-                name=self.config.run_name,
-                config=vars(self.config), # Log all argparse args
-            )
-            wandb.watch(self.model, log="all")
-            
-            # --- Define Custom Steps ---
-            wandb.define_metric("train/step") # Master step for training
-            wandb.define_metric("val/step")   # Master step for validation
+            try:
+                wandb.init(
+                    project=self.config.wandb_project,
+                    name=self.config.run_name,
+                    config=vars(self.config)
+                )
+                wandb.watch(self.model, log="all", log_freq=100) # Log gradients less frequently
+                wandb.define_metric("train/step"); wandb.define_metric("val/step")
+                wandb.define_metric("train/*", step_metric="train/step")
+                wandb.define_metric("val/*", step_metric="val/step")
+                wandb.define_metric("epoch", step_metric="train/step") # Link epoch to train step
+                wandb.define_metric("epoch", step_metric="val/step")   # Link epoch to val step
+                logging.info(f"WandB initialized for project '{self.config.wandb_project}', run '{self.config.run_name}'.")
+            except Exception as e:
+                 logging.error(f"Failed to initialize WandB: {e}")
+                 self.config.is_wandb = False # Disable if init fails
+        else:
+            logging.info("WandB disabled.")
 
-            # --- Link metrics to steps ---
-            # Train metrics use train/step
-            wandb.define_metric("train/*", step_metric="train/step")
-            # Validation metrics use val/step
-            wandb.define_metric("val/*", step_metric="val/step")
-            logging.info(f"WandB initialized for project '{self.config.wandb_project}', run '{self.config.run_name}'.")
-
+    # --- Checkpoint Helper ---
     def _save_checkpoint(self, epoch, is_best=False):
         checkpoint_data = {
             'epoch': epoch + 1,
-            'model_state_dict': self.model.state_dict(), 
+            'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            "config": vars(self.config)
+            'train_step': self.train_step, # Save steps
+            'val_step': self.val_step,
+            "config": vars(self.config) # Save config
         }
         if not self.config.is_ref_training:
             checkpoint_data['alpha_privileged'] = self.alpha_privileged
             checkpoint_data['alpha_non_privileged'] = self.alpha_non_privileged
 
+        # Save epoch specific
         filename = f"checkpoint_epoch_{epoch+1}.pth"
         filepath = self.checkpoint_dir / filename
         torch.save(checkpoint_data, filepath)
-        logging.info(f"Checkpoint saved to {filepath}")
+        logging.info(f"Checkpoint saved: {filepath}")
 
         if is_best:
-            best_filename = "checkpoint_best.pth"
-            best_filepath = self.checkpoint_dir / best_filename
+            best_filepath = self.checkpoint_dir / "checkpoint_best.pth"
             torch.save(checkpoint_data, best_filepath)
-            logging.info(f"Best checkpoint saved to {best_filepath}")
+            logging.info(f"Best checkpoint saved: {best_filepath}")
 
+    # --- Helper to process a batch (forward pass + metric computation) ---
+    def _process_batch(self, batch: Dict[str, torch.Tensor]) -> Optional[Tuple[Dict[str, Any], int]]:
+        """
+        Moves batch to device, performs forward pass, and computes metrics.
+
+        Returns:
+            Tuple of (results_dict, current_batch_size) or None if batch is invalid.
+            results_dict contains 'outputs', 'logits', 'loss', 'acc', 'f1', 'map', 'em'.
+        """
+        if batch is None or 'pixels' not in batch or batch['pixels'].numel() == 0:
+            logging.warning("Skipping empty or invalid batch.")
+            return None
+
+        pixels = batch['pixels'].to(self.device)
+        labels = batch['labels'].to(self.device)
+        current_batch_size = pixels.size(0)
+
+        output_dict = self.model(pixels=pixels, labels=labels)
+        return output_dict, current_batch_size
+
+    # --- Helper to update epoch metrics accumulator ---
+    def _update_epoch_metrics(self, epoch_metrics: Dict[str, Any], results_dict: Dict[str, Any], batch_size: int):
+        """Updates the epoch metrics dictionary with results from a batch."""
+
+        # Accumulate Losses (weighted by batch size)
+        loss_comp = results_dict.get('loss')
+        if self.config.is_ref_training:
+            epoch_metrics['loss_sft'] += loss_comp['loss'].item() * batch_size
+        else:
+            # For FairPO, loss_components['loss'] was placeholder sum, use priv/non_priv
+            epoch_metrics['loss_priv'] += loss_comp['privileged'].item() * batch_size
+            epoch_metrics['loss_non_priv'] += loss_comp['non_privileged'].item() * batch_size
+            epoch_metrics['loss_total'] += (loss_comp.get('privileged') * self.alpha_privileged.item() + loss_comp.get('non_privileged') * self.alpha_non_privileged.item()) * batch_size
+
+        # Accumulate Accuracies (weighted by batch size)
+        acc_comp = results_dict.get('acc')
+        epoch_metrics['acc_overall'] += acc_comp['acc'] * batch_size
+        epoch_metrics['acc_priv'] += acc_comp['privileged'] * batch_size
+        epoch_metrics['acc_non_priv'] += acc_comp['non_privileged'] * batch_size
+        
+        # Accumulate EM (weighted by batch size)
+        em_comp = results_dict.get('em')
+        epoch_metrics['em'] += em_comp['em'] * batch_size
+        epoch_metrics['em_priv'] += em_comp['em_privileged'] * batch_size
+        epoch_metrics['em_non_priv'] += em_comp['em_non_privileged'] * batch_size
+
+        # Accumulate F1 Scores (weighted by batch size)
+        f1_comp = results_dict.get('f1')
+        epoch_metrics['f1'] += f1_comp['f1'] * batch_size
+        epoch_metrics['f1_priv'] += f1_comp['f1_privileged'] * batch_size
+        epoch_metrics['f1_non_priv'] += f1_comp['f1_non_privileged'] * batch_size
+
+        # Accumulate mAP Scores (weighted by batch size)
+        map_comp = results_dict.get('map')
+        epoch_metrics['map_overall'] += map_comp['mAP'] * batch_size
+        epoch_metrics['map_priv'] += map_comp['mAP_privileged'] * batch_size
+        epoch_metrics['map_non_priv'] += map_comp['mAP_non_privileged'] * batch_size
+
+    # --- Helper for optimization step ---
+    def _perform_optimization_step(self, loss: torch.Tensor) -> Optional[float]:
+        """Performs backward pass, gradient clipping, and optimizer step."""
+        loss.backward()
+        grad_norm = self._calculate_grad_norm(self.trainable_params) # Before clipping
+
+        if self.config.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.trainable_params, self.config.grad_clip)
+
+        self.optimizer.step()
+        return grad_norm.item() # Return scalar grad norm
+
+    # --- Helper to calculate and log batch metrics (training only) ---
+    def _log_wandb_train_batch_metrics(self, results_dict: Dict[str, Any], grad_norm: Optional[float], param_norm: float, epoch: int, batch_idx: int, num_batches: int):
+        """Logs detailed metrics for a single training batch."""
+        if not self.config.is_wandb: return # Skip if wandb disabled
+
+        batch_log = {'train/step': self.train_step, 'epoch': epoch + (batch_idx + 1) / num_batches}
+
+        # Losses
+        loss_comp = results_dict.get('loss')
+        if loss_comp:
+            if self.config.is_ref_training:
+                batch_log['train/sft_loss'] = loss_comp.get('loss', torch.tensor(np.nan)).item()
+            else:
+                batch_log['train/privileged_loss'] = loss_comp.get('privileged', torch.tensor(np.nan)).item()
+                batch_log['train/non_privileged_loss'] = loss_comp.get('non_privileged', torch.tensor(np.nan)).item()
+                batch_log['train/combined_loss'] = loss_comp.get('combined_loss', torch.tensor(np.nan)).item() 
+                batch_log["train/alpha_p"] = self.alpha_privileged.item()
+                batch_log["train/alpha_np"] = self.alpha_non_privileged.item()
+
+        # Accuracies
+        acc_comp = results_dict.get('acc')
+        if acc_comp:
+            batch_log['train/accuracy_overall'] = acc_comp.get('acc')
+            batch_log['train/accuracy_privileged'] = acc_comp.get('privileged')
+            batch_log['train/accuracy_non_privileged'] = acc_comp.get('non_privileged')
+            
+        em_comp = results_dict.get('em')
+        if em_comp:
+            batch_log['train/exact_match_overall'] = em_comp.get('em')
+            batch_log['train/exact_match_privileged'] = em_comp.get('em_privileged')
+            batch_log['train/exact_match_non_privileged'] = em_comp.get('em_non_privileged')
+
+        # F1 Scores
+        f1_comp = results_dict.get('f1')
+        if f1_comp:
+            batch_log['train/f1'] = f1_comp.get('macro_f1')
+            batch_log['train/f1_privileged'] = f1_comp.get('f1_privileged')
+            batch_log['train/f1_non_privileged'] = f1_comp.get('f1_non_privileged')
+
+        # mAP Scores
+        map_comp = results_dict.get('map')
+        if map_comp:
+            batch_log['train/map_overall'] = map_comp.get('mAP')
+            batch_log['train/map_privileged'] = map_comp.get('mAP_privileged')
+            batch_log['train/map_non_privileged'] = map_comp.get('mAP_non_privileged')
+
+        # Norms and LR
+        batch_log['train/grad_norm'] = grad_norm
+        batch_log['train/param_norm'] = param_norm
+        batch_log['train/learning_rate'] = self.optimizer.param_groups[0]['lr']
+        wandb.log({k: v for k, v in batch_log.items() if not isinstance(v, float) or not np.isnan(v)}) # Filter NaNs before logging
+
+    # --- Helper to calculate epoch averages ---
+    def _calculate_epoch_averages(self, epoch_metrics: Dict[str, Any], processed_items: int) -> Dict[str, float]:
+        """Calculates average metrics for an epoch."""
+        avg_metrics = {}
+        if processed_items == 0: # Avoid division by zero
+            logging.warning("No items processed in epoch, metrics will be NaN.")
+            # Populate with NaNs based on expected keys in epoch_metrics
+            for k in epoch_metrics: avg_metrics[k.replace('loss_', 'avg_loss_').replace('acc_', 'avg_acc_').replace('f1_', 'avg_f1_').replace('map_', 'avg_map_').replace('em_', 'avg_em_')] = np.nan
+            return avg_metrics
+
+        for key, value in epoch_metrics.items():
+            avg_key = key.replace('loss_', 'avg_loss_').replace('acc_', 'avg_acc_').replace('f1_', 'avg_f1_').replace('map_', 'avg_map_').replace('em_', 'avg_em_')
+            avg_metrics[avg_key] = value / processed_items
+        
+        return avg_metrics
+
+    # --- Train Method ---
     def train(self):
         logging.info("Starting training...")
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        best_val_metric = float('inf') # Or float('-inf') if maximizing
 
         for epoch in range(self.start_epoch, self.config.epochs):
             self.model.train()
+            # Initialize accumulator dict with ALL expected metric keys
             epoch_metrics = {
                 'loss_priv': 0.0, 'loss_non_priv': 0.0, 'loss_total': 0.0, 'loss_sft': 0.0,
-                'acc_priv': 0.0, 'acc_non_priv': 0.0, 'acc_overall': 0.0,
-                'grad_norm': 0.0, 'param_norm': 0.0 
+                'acc_overall': 0.0, 'acc_priv': 0.0, 'acc_non_priv': 0.0,
+                'em': 0.0, 'em_priv': 0.0, 'em_non_priv': 0.0,
+                'f1': 0.0, 'f1_priv': 0.0, 'f1_non_priv': 0.0,
+                'map_overall': 0.0, 'map_priv': 0.0, 'map_non_priv': 0.0
             }
-            processed_items = 0 # Count total items processed in the epoch
+            processed_items = 0
+            processed_batches = 0
+            num_batches = len(self.train_loader)
+
             batch_iter = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config.epochs}", unit="batch")
             start_time = time.time()
 
             for i, batch in enumerate(batch_iter):
-                pixels = batch['pixels'].to(self.device)
-                labels = batch['labels'].to(self.device)
-
+                # --- Process Batch (Forward + Metrics) ---
+                processed_batch_info = self._process_batch(batch)
+                results_dict, current_batch_size = processed_batch_info
+                loss_components = results_dict['loss']
                 self.optimizer.zero_grad()
 
-                # Forward pass
-                output_dict = self.model(pixels=pixels, labels=labels)
-                loss_components = output_dict['loss']
-                acc_components = output_dict['acc']
-                current_batch_size = pixels.size(0)
-                batch_log_payload = {} # For logging this specific batch
-
-                # --- Loss Calculation & Backpropagation ---
+                # --- Determine Loss for Backpropagation ---
                 if self.config.is_ref_training:
-                    # --- SFT Training ---
-                    loss = loss_components.get("loss", torch.tensor(0.0, device=self.device))
-                    batch_log_payload["train/sft_loss"] = loss.item()
-                    epoch_metrics['loss_sft'] += loss.item() * current_batch_size # Weighted sum
-                else:
-                    # --- FairPO Training ---
+                    loss = loss_components.get("loss", torch.tensor(0.0, device=self.device)) # SFT loss
+                else: # FairPO training
                     loss_priv = loss_components.get("privileged", torch.tensor(0.0, device=self.device))
                     loss_non_priv = loss_components.get("non_privileged", torch.tensor(0.0, device=self.device))
 
-                    batch_log_payload["train/privileged_loss"] = loss_priv.item()
-                    batch_log_payload["train/non_privileged_loss"] = loss_non_priv.item()
-                    epoch_metrics['loss_priv'] += loss_priv.item() * current_batch_size # Weighted sum
-                    epoch_metrics['loss_non_priv'] += loss_non_priv.item() * current_batch_size # Weighted sum
-
-                    # GRPO Alpha Update
+                    # GRPO Alpha Update (In-place update of self.alpha_...)
                     with torch.no_grad():
-                        new_alpha_priv = self.alpha_privileged * torch.exp(self.config.eta_alpha * loss_priv)
-                        new_alpha_non_priv = self.alpha_non_privileged * torch.exp(self.config.eta_alpha * loss_non_priv)
+                        # Clamp loss before exp for stability
+                        exp_arg_p = (self.config.eta_alpha * loss_priv).clamp(-10, 10)
+                        exp_arg_np = (self.config.eta_alpha * loss_non_priv).clamp(-10, 10)
+                        new_alpha_priv = self.alpha_privileged * torch.exp(exp_arg_p)
+                        new_alpha_non_priv = self.alpha_non_privileged * torch.exp(exp_arg_np)
                         Z = new_alpha_priv + new_alpha_non_priv + 1e-8
                         self.alpha_privileged = new_alpha_priv / Z
                         self.alpha_non_privileged = new_alpha_non_priv / Z
-
-                    batch_log_payload["train/alpha_p"] = self.alpha_privileged.item()
-                    batch_log_payload["train/alpha_np"] = self.alpha_non_privileged.item()
-
+            
                     # Combined loss for backpropagation
-                    loss = self.alpha_privileged * loss_priv + self.alpha_non_privileged * loss_non_priv
-                    batch_log_payload["train/combined_loss"] = loss.item()
-                    epoch_metrics['loss_total'] += loss.item() * current_batch_size # Weighted sum
+                    loss = self.alpha_privileged * loss_priv + self.alpha_non_privileged * loss_non_priv # Note: loss_components['loss'] is a placeholder sum, not used for backprop
+                    results_dict['loss']['combined_loss'] = loss # Store combined loss for logging
+                    
+                # --- Optimization Step ---
+                grad_norm_val = self._perform_optimization_step(loss)
+        
+                # --- Post-Optimization Steps ---
+                self.train_step += 1
+                param_norm_val = self._calculate_norm(self.trainable_params).item()
 
-                # --- Backpropagate the determined loss ---
-                loss.backward()
+                # --- Accumulate Metrics ---
+                self._update_epoch_metrics(epoch_metrics, results_dict, current_batch_size)
+                processed_items += current_batch_size
+                processed_batches += 1
 
-                # --- Calculate Gradient Norm (before clipping) ---
-                grad_norm = self._calculate_grad_norm(trainable_params)
-                batch_log_payload["train/grad_norm"] = grad_norm.item()
-                epoch_metrics['grad_norm'] += grad_norm.item() # Simple sum for averaging later
-
-                # --- Gradient Clipping ---
-                if self.config.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(trainable_params, self.config.grad_clip)
-
-                # --- Optimizer Step ---
-                self.optimizer.step()
-                self.train_step += 1 # Increment train step after successful step
-
-                # --- Calculate Parameter Norm ---
-                param_norm = self._calculate_norm(trainable_params)
-                batch_log_payload["train/param_norm"] = param_norm.item()
-                epoch_metrics['param_norm'] += param_norm.item() # Simple sum for averaging later
-                
-                # --- Accuracy Accumulation ---
-                acc_priv_val = acc_components.get("privileged", np.nan)
-                acc_non_priv_val = acc_components.get("non_privileged", np.nan)
-                acc_overall_val = acc_components.get("acc", np.nan)
-
-                if not np.isnan(acc_priv_val): epoch_metrics['acc_priv'] += acc_priv_val * current_batch_size
-                if not np.isnan(acc_non_priv_val): epoch_metrics['acc_non_priv'] += acc_non_priv_val * current_batch_size
-                if not np.isnan(acc_overall_val): epoch_metrics['acc_overall'] += acc_overall_val * current_batch_size
-
-                batch_log_payload["train/accuracy_overall"] = acc_overall_val
-                batch_log_payload["train/accuracy_privileged"] = acc_priv_val
-                batch_log_payload["train/accuracy_non_privileged"] = acc_non_priv_val
-                batch_log_payload["train/learning_rate"] = self.optimizer.param_groups[0]['lr']
-                batch_log_payload["train/step"] = self.train_step # Add the step itself to log
-
-                processed_items += current_batch_size # Use total items processed
-
-                # --- Logging ---
-                batch_log_payload["epoch"] = epoch + (i+1) / len(self.train_loader) # Fractional epoch
+                # --- Log Batch Metrics (conditional) ---
                 if self.config.is_wandb:
-                    wandb.log(batch_log_payload) # Log step metrics (uses train/step automatically)
+                    self._log_wandb_train_batch_metrics(results_dict, grad_norm_val, param_norm_val, epoch, i, num_batches)
 
-                # Update tqdm progress bar
+                # --- Update TQDM ---
                 tqdm_postfix = {
-                    'loss': batch_log_payload.get('train/combined_loss', batch_log_payload.get('train/sft_loss', 0.0)),
-                    'acc': batch_log_payload.get('train/accuracy_overall', 0.0),
-                    'gnorm': batch_log_payload.get('train/grad_norm', 0.0),
+                    'loss': loss.item(), # Show loss used for backprop
+                    'acc': results_dict.get('acc', {}).get('acc'),
                     'step': self.train_step
                 }
                 if not self.config.is_ref_training:
-                    tqdm_postfix['alpha_p'] = batch_log_payload.get('train/alpha_p', 0.0)
+                    tqdm_postfix['alpha_p'] = self.alpha_privileged.item()
                 batch_iter.set_postfix(**{k: f"{v:.3f}" if isinstance(v, float) else v for k, v in tqdm_postfix.items()})
 
             # --- End of Epoch ---
             epoch_duration = time.time() - start_time
             logging.info(f"Epoch {epoch+1} completed in {epoch_duration:.2f}s")
 
-            # --- Validation ---
-            val_metrics = self._validate(epoch) # Returns dict with 'val/...' keys
+            # Calculate average epoch metrics
+            avg_train_metrics = self._calculate_epoch_averages(epoch_metrics, processed_items)
+            # Prefix keys with 'train/'
+            avg_train_metrics = {f"train/{k.replace('avg_', '')}": v for k, v in avg_train_metrics.items()}
 
-            # Determine the primary validation metric for checkpointing
+            # Validation
+            avg_val_metrics = self._validate(epoch) # Returns dict with 'val/...' prefixed keys
+
+            # Log validation summary
+            self._log_wandb_validation_summary(epoch, avg_val_metrics)
+
+            # Determine best metric for checkpointing
+            # Use validation loss as the default metric to minimize
             if self.config.is_ref_training:
-                current_val_metric = val_metrics.get('val/loss_sft', float('inf'))
+                current_val_metric = avg_val_metrics.get('val/loss_sft')
             else:
-                # Use combined loss for checkpointing FairPO
-                current_val_metric = val_metrics.get('val/loss_total', float('inf')) # Note: loss_total used here
+                # For FairPO, maybe use combined loss, worst-group metric, or overall performance?
+                # Using combined loss for now as per previous logic
+                current_val_metric = avg_val_metrics.get('val/loss_total')
 
-            # Log Validation Metrics (against val/step)
-            val_metrics["val/step"] = self.val_step # Add the val step
-            val_metrics["epoch"] = epoch + 1 # Also log epoch for reference
-            if self.config.is_wandb:
-                wandb.log(val_metrics) # Log val metrics (uses val/step)
+            is_best = current_val_metric < best_val_metric
+            if is_best:
+                best_val_metric = current_val_metric
+                logging.info(f"New best validation metric: {best_val_metric:.4f}")
 
-            # --- Checkpointing ---
-            self._save_checkpoint(epoch, is_best=False)
+            # Save checkpoint
+            self._save_checkpoint(epoch, is_best=is_best)
+            
+            # Log epoch summary to console
+            self._log_epoch_summary_console(epoch, avg_train_metrics, mode='train')
+            self._log_epoch_summary_console(epoch, avg_val_metrics, mode='val')
 
         logging.info("Training finished.")
         if self.config.is_wandb:
             logging.info("Finishing WandB run.")
             wandb.finish()
 
-    def _validate(self, epoch):
+    # --- Validate Method ---
+    def _validate(self, epoch: int) -> Dict[str, float]:
+        """Runs validation loop and returns averaged metrics."""
         logging.info(f"Starting validation for epoch {epoch+1}...")
         self.model.eval()
-        val_metrics = {
+        # Initialize accumulator dict
+        val_epoch_metrics = {
             'loss_priv': 0.0, 'loss_non_priv': 0.0, 'loss_total': 0.0, 'loss_sft': 0.0,
-            'acc_priv': 0.0, 'acc_non_priv': 0.0, 'acc_overall': 0.0
+            'acc_overall': 0.0, 'acc_priv': 0.0, 'acc_non_priv': 0.0,
+            'em': 0.0, 'em_priv': 0.0, 'em_non_priv': 0.0,
+            'f1': 0.0, 'f1_priv': 0.0, 'f1_non_priv': 0.0,
+            'map_overall': 0.0, 'map_priv': 0.0, 'map_non_priv': 0.0
         }
         processed_items = 0
 
         with torch.no_grad():
             val_iter = tqdm(self.val_loader, desc=f"Validation Epoch {epoch+1}", unit="batch", leave=False)
             for batch in val_iter:
-                pixels = batch['pixels'].to(self.device)
-                labels = batch['labels'].to(self.device)
-                current_batch_size = pixels.size(0)
+                processed_batch_info = self._process_batch(batch)
+                if processed_batch_info is None:
+                    continue
+                results_dict, current_batch_size = processed_batch_info
 
-                output_dict = self.model(pixels=pixels, labels=labels)
-                loss_components = output_dict['loss']
-                acc_components = output_dict['acc']
-
-                # Accumulate metrics (weighted sum by batch size)
-                if self.config.is_ref_training:
-                    loss = loss_components.get("loss", torch.tensor(np.nan, device=self.device))
-                    if not torch.isnan(loss): val_metrics['loss_sft'] += loss.item() * current_batch_size
-                else:
-                    loss_priv = loss_components.get("privileged", torch.tensor(np.nan, device=self.device))
-                    loss_non_priv = loss_components.get("non_privileged", torch.tensor(np.nan, device=self.device))
-                    val_metrics['loss_priv'] += loss_priv.item() * current_batch_size
-                    val_metrics['loss_non_priv'] += loss_non_priv.item() * current_batch_size
-
-                    # Use current training alphas for combined loss calculation (consistent reporting)
-                    alpha_p = self.alpha_privileged.item() if hasattr(self, 'alpha_privileged') else 0.5
-                    alpha_np = self.alpha_non_privileged.item() if hasattr(self, 'alpha_non_privileged') else 0.5
-                    combined_loss = alpha_p * loss_priv + alpha_np * loss_non_priv
-                    val_metrics['loss_total'] += combined_loss.item() * current_batch_size
-    
-                acc_priv_val = acc_components.get("privileged", np.nan)
-                acc_non_priv_val = acc_components.get("non_privileged", np.nan)
-                acc_overall_val = acc_components.get("acc", np.nan)
-
-                val_metrics['acc_priv'] += acc_priv_val * current_batch_size
-                val_metrics['acc_non_priv'] += acc_non_priv_val * current_batch_size
-                val_metrics['acc_overall'] += acc_overall_val * current_batch_size
-
+                # Use the helper to accumulate other metrics
+                self._update_epoch_metrics(val_epoch_metrics, results_dict, current_batch_size)
                 processed_items += current_batch_size
 
-        self.val_step += 1 # Increment validation step counter *after* validation loop
-        
-        # Calculate average validation metrics and prefix keys
-        avg_val_metrics = {f"val/{k}": v / processed_items for k, v in val_metrics.items()}
+        # Calculate average validation metrics
+        avg_val_metrics_raw = self._calculate_epoch_averages(val_epoch_metrics, processed_items)
 
-        logging.info(f"--- Validation Epoch {epoch+1} Results (Val Step {self.val_step}) ---")
-        if self.config.is_ref_training:
-            logging.info(f"  Avg Loss (SFT): {avg_val_metrics.get('val/loss_sft', np.nan):.4f}")
-        else:
-            logging.info(f"  Avg Loss (Priv): {avg_val_metrics.get('val/loss_priv', np.nan):.4f}")
-            logging.info(f"  Avg Loss (Non-Priv): {avg_val_metrics.get('val/loss_non_priv', np.nan):.4f}")
-            logging.info(f"  Avg Loss (Combined): {avg_val_metrics.get('val/loss_total', np.nan):.4f}") # Note: uses 'loss_total' key
-        logging.info(f"  Avg Acc (Overall): {avg_val_metrics.get('val/acc_overall', np.nan):.4f}")
-        logging.info(f"  Avg Acc (Priv): {avg_val_metrics.get('val/acc_priv', np.nan):.4f}")
-        logging.info(f"  Avg Acc (Non-Priv): {avg_val_metrics.get('val/acc_non_priv', np.nan):.4f}")
-        logging.info(f"---------------------------------------------")
+        # Prefix keys with 'val/'
+        avg_val_metrics = {f"val/{k.replace('avg_', '')}": v for k, v in avg_val_metrics_raw.items()}
+
+        # Increment val_step AFTER calculations for this epoch
+        self.val_step += 1
+
+        # Log validation summary to console
+        self._log_wandb_validation_summary(epoch, avg_val_metrics)
 
         self.model.train() # Set back to training mode
-        return avg_val_metrics
+        return avg_val_metrics # Return dict with 'val/' prefixes
 
+    # --- Helper to log validation summary (console) ---
+    def _log_epoch_summary_console(self, epoch: int, avg_epoch_metrics: Dict[str, float], mode: str):
+        """Logs the summary metrics for an epoch (train or val) to the console."""
+        if mode not in ['train', 'val']:
+            logging.warning(f"Invalid mode '{mode}' provided to _log_epoch_summary_console. Skipping log.")
+            return
+
+        # Determine prefix based on mode
+        prefix = f"{mode}/"
+        title_prefix = "Training" if mode == 'train' else "Validation"
+        step_info = f"(Train Step {self.train_step})" if mode == 'train' else f"(Val Step {self.val_step})"
+
+        logging.info(f"--- {title_prefix} Epoch {epoch+1} Results {step_info} ---")
+
+        # Log Losses
+        if self.config.is_ref_training:
+            # SFT mode only has one loss
+            logging.info(f"  Avg Loss (SFT): {avg_epoch_metrics.get(f'{prefix}loss_sft'):.4f}")
+        else:
+            # FairPO mode has component losses
+            logging.info(f"  Avg Loss (Priv): {avg_epoch_metrics.get(f'{prefix}loss_priv'):.4f}")
+            logging.info(f"  Avg Loss (Non-Priv): {avg_epoch_metrics.get(f'{prefix}loss_non_priv'):.4f}")
+            # The 'loss_total' key should store the combined loss used for optimization/evaluation
+            logging.info(f"  Avg Loss (Combined): {avg_epoch_metrics.get(f'{prefix}loss_total'):.4f}")
+
+        # Log Accuracies
+        logging.info(f"  Avg Acc (Overall): {avg_epoch_metrics.get(f'{prefix}acc_overall'):.4f}")
+        logging.info(f"  Avg Acc (Priv): {avg_epoch_metrics.get(f'{prefix}acc_priv'):.4f}")
+        logging.info(f"  Avg Acc (Non-Priv): {avg_epoch_metrics.get(f'{prefix}acc_non_priv'):.4f}")
+        
+        # Log Exact Match (EM) Scores
+        logging.info(f"  Avg EM (Overall): {avg_epoch_metrics.get(f'{prefix}em'):.4f}")
+        logging.info(f"  Avg EM (Priv): {avg_epoch_metrics.get(f'{prefix}em_priv'):.4f}")
+        logging.info(f"  Avg EM (Non-Priv): {avg_epoch_metrics.get(f'{prefix}em_non_priv'):.4f}")
+
+        # Log F1 Scores
+        logging.info(f"  Avg F1 (Overall): {avg_epoch_metrics.get(f'{prefix}f1'):.4f}")
+        logging.info(f"  Avg F1 (Priv): {avg_epoch_metrics.get(f'{prefix}f1_priv'):.4f}")
+        logging.info(f"  Avg F1 (Non-Priv): {avg_epoch_metrics.get(f'{prefix}f1_non_priv'):.4f}")
+
+        # Log mAP Scores
+        logging.info(f"  Avg mAP (Overall): {avg_epoch_metrics.get(f'{prefix}map_overall'):.4f}")
+        logging.info(f"  Avg mAP (Priv): {avg_epoch_metrics.get(f'{prefix}map_priv'):.4f}")
+        logging.info(f"  Avg mAP (Non-Priv): {avg_epoch_metrics.get(f'{prefix}map_non_priv'):.4f}")
+
+        logging.info(f"---------------------------------------------")
+
+    # --- Helper to log epoch summary (WandB) ---
+    def _log_wandb_validation_summary(self, epoch: int, val_metrics: Dict[str, float]):
+        """Logs average training and validation metrics for the epoch to WandB."""
+        if not self.config.is_wandb: return
+
+        log_payload = {}
+        log_payload.update(val_metrics)
+
+        # Add step info
+        log_payload['train/step'] = self.train_step
+        log_payload['val/step'] = self.val_step
+        log_payload['epoch'] = epoch + 1 # Log integer epoch
+
+        wandb.log({k: v for k, v in log_payload.items() if not isinstance(v, float) or not np.isnan(v)}) # Filter NaNs
+        
+    # --- Helper to generate run name ---
+    def _get_run_name(self) -> str:
+        """Generates a descriptive run name based on config."""
+        if self.config.run_name: # Use provided name if exists
+             return self.config.run_name
+
+        # Generate dynamically
+        mode = "SFT" if self.config.is_ref_training else "FairPO"
+        loss_part = f"_{self.config.loss_type}" if not self.config.is_ref_training and self.config.loss_type else ""
+        lr_str = f"lr{self.config.learning_rate:.0e}" # Scientific notation
+        ep_str = f"ep{self.config.epochs}"
+        frac_str = f"frac{self.config.train_frac:.2f}"
+
+        # Add specific FairPO params if not SFT
+        fairpo_params = ""
+        if not self.config.is_ref_training:
+            eta_str = f"eta{self.config.eta_alpha}"
+            eps_str = f"_eps{self.config.epsilon}"
+            beta_str = f"_beta{self.config.beta}"
+            fairpo_params = f"{eta_str}{eps_str}{beta_str}_"
+
+        run_name = f"{mode}{loss_part}_{lr_str}_{fairpo_params}{frac_str}_{ep_str}"
+        logging.info(f"Generated run name: {run_name}")
+        return run_name
+
+# --- main function remains the same as your provided version ---
 def main():
     parser = argparse.ArgumentParser(description="Train FairPO Model for Multi-Label Classification")
 
-    if "raid" in str(Path.cwd()):
-        user_dir = "/raid/speech/soumen"
-    else:
-        user_dir = "home/soumen"
+    # Detect user/system path
+    if "raid" in str(Path.cwd()).lower(): user_dir = "/raid/speech/soumen"
+    elif "home" in str(Path.cwd()).lower(): user_dir = "/home/soumen"
+    else: user_dir = "."; logging.warning(f"Defaulting user_dir to '.'")
     current_dir = Path.cwd()
-    
+    default_coco_root = f"{user_dir}/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014"
+ 
     # Paths
-    ref_cls_weights_path = None # f"{current_dir}/output/ckpt/ref_model/ckpt_ep_latest.pth"
-    parser.add_argument('--coco_root', type=str, default=f"{user_dir}/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014", help='Root directory of the COCO dataset') # CHANGE THIS
+    ref_cls_weights_path = f"{current_dir}/output/ckpt/FairPO-train/SFT_lr5e-05_frac1.00_ep5/checkpoint_best.pth" # !IMP: CHANGE THIS
+    parser.add_argument('--coco_root', type=str, default=default_coco_root, help='Root directory of the COCO dataset') 
     parser.add_argument('--index_dir', type=str, default=None, help='Directory for dataset index files (default: coco_root/.index_cache)')
-    parser.add_argument('--checkpoint_dir', type=str, default='./output/ckpt/fairpo_model', help='Directory to save checkpoints')
+    parser.add_argument('--checkpoint_dir', type=str, default='./output/ckpt', help='Directory to save checkpoints')
     parser.add_argument('--ref_cls_weights_path', type=str, default=ref_cls_weights_path, help='Path to SFT pre-trained reference classifier weights (REQUIRED for FairPO training/testing)') # Make default None
 
     # Model & Data
     parser.add_argument('--model_name', type=str, default='google/vit-base-patch16-224', help='Vision Transformer model name')
-    parser.add_argument('--train_frac', type=float, default=1.0, help='Fraction of training data (0.0 to 1.0)')
-    parser.add_argument('--val_frac', type=float, default=1.0, help='Fraction of validation data (0.0 to 1.0)')
+    parser.add_argument('--train_frac', type=float, default=1.0, help='Fraction of training data (0.0 to 1.0)') # !IMP: CHANGE THIS
+    parser.add_argument('--val_frac', type=float, default=1.0, help='Fraction of validation data (0.0 to 1.0)') # !IMP: CHANGE THIS
     parser.add_argument('--privileged_indices', type=str, default="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19", help='Comma-separated privileged label indices')
     parser.add_argument('--force_regenerate_index', default=False, help='Force regeneration of dataset index')
 
     # Training Hyperparameters
-    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs') 
     parser.add_argument('--batch_size', type=int, default=16, help='Training batch size')
-    parser.add_argument('--learning_rate', type=float, default=5e-5, help='Optimizer learning rate')
+    parser.add_argument('--learning_rate', type=float, default=5e-5, help='Optimizer learning rate') 
     parser.add_argument('--weight_decay', type=float, default=0.1, help='Optimizer weight decay')
-    parser.add_argument('--beta', type=float, default=2.0, help='DPO beta hyperparameter')
-    parser.add_argument('--epsilon', type=float, default=0.1, help='Constraint slack epsilon')
+    parser.add_argument('--beta', type=float, default=2.0, help='DPO beta hyperparameter') 
+    parser.add_argument('--epsilon', type=float, default=0.01, help='Constraint slack epsilon')
     parser.add_argument('--eta_alpha', type=float, default=0.0001, help='Learning rate for GRPO alpha weights')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value (0 to disable)')
 
     # Training Mode
-    parser.add_argument('--is_ref_training', default=True, help='Train the reference model (SFT) only.')
+    parser.add_argument('--is_ref_training', default=False, help='Train the reference model (SFT) only.') # !IMP: CHANGE THIS
+    parser.add_argument('--loss_type', default='dpo', help='Loss type (dpo, simpo, cpo)') # If ref_training, this is ignored
 
     # System
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
@@ -434,29 +625,12 @@ def main():
 
     # WandB
     parser.add_argument('--wandb_project', type=str, default="FairPO-train", help='WandB project name (disable if blank)')
-    parser.add_argument('--is_wandb', type=bool, default=True, help='Whether to use WandB for logging')
+    parser.add_argument('--is_wandb', type=bool, default=True, help='Whether to use WandB for logging') # !IMP: CHANGE THIS
     parser.add_argument('--run_name', type=str, default=None, help='Custom WandB run name (e.g., FairPO_b64_lr1e-5_eta0.01)')
 
     args = parser.parse_args()
 
-    # Dynamic Run Name if not provided and WandB is enabled
-    if args.wandb_project:
-        mode = "SFT" if args.is_ref_training else "FairPO"
-        lr = args.learning_rate
-        eta_str = f"_eta{args.eta_alpha}" if not args.is_ref_training else ""
-        eps_str = f"_eps{args.epsilon}" if not args.is_ref_training else ""
-        beta_str = f"_beta{args.beta}" if not args.is_ref_training else ""
-        args.run_name = f"{mode}_frac{args.train_frac}_ep{args.epochs}_lr{lr}{eta_str}{eps_str}{beta_str}"
-        logging.info(f"Generated WandB run name: {args.run_name}")
-  
-    # Set default index_dir if None
-    if args.index_dir is None:
-        args.index_dir = Path(args.coco_root) / '.index_cache'
-        logging.info(f"Using default index directory: {args.index_dir}")
-    args.index_dir = Path(args.index_dir) # Ensure it's a Path object
-    args.index_dir.mkdir(parents=True, exist_ok=True)
-
-    # Initialize Trainer
+    # Initialize Trainer and start training
     trainer = ModelTrainer(args)
     trainer.train()
 
