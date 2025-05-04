@@ -1,11 +1,13 @@
 from datasets import load_dataset
-import torch, tqdm, os, sys, pickle, datetime, logging, random, csv
+import torch, tqdm, os, sys, pickle, datetime, logging, random, csv, logging
+import pandas as pd
 from PIL import Image, UnidentifiedImageError
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader, Subset
 from typing import Tuple, List, Dict, Optional
 from torchvision import transforms
 torch.manual_seed(42)
+from tqdm import tqdm
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -473,11 +475,70 @@ def collate_fn_skip_none(batch):
     # Use default collate on the filtered batch
     return torch.utils.data.dataloader.default_collate(batch)
 
+def get_label_distribution(dataset: COCODatasetOnDemand, batch_size: int = 64, num_workers: int = 4):
+    """
+    Calculates the distribution of positive labels in a COCODatasetOnDemand.
+
+    Args:
+        dataset: An initialized instance of COCODatasetOnDemand.
+        batch_size: Batch size for efficient loading.
+        num_workers: Number of workers for the DataLoader.
+
+    Returns:
+        pandas.DataFrame: DataFrame with columns 'label_id', 'label_name', 'count'.
+                          Returns None if dataset is empty or label names are missing.
+    """
+    label_names = dataset.get_label_names()
+    if not label_names:
+        logging.error("Dataset does not contain label names.")
+        return None
+
+    num_labels = len(label_names)
+    if len(dataset) == 0:
+        logging.warning("Dataset is empty. Returning empty distribution.")
+        return pd.DataFrame({'label_id': [], 'label_name': [], 'count': []})
+
+    # Initialize counts
+    label_counts = torch.zeros(num_labels, dtype=torch.int64)
+
+    # Use DataLoader for efficient iteration
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False, # Order doesn't matter for counting
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=collate_fn_skip_none # Important to handle potential None items
+    )
+
+    logging.info(f"Calculating label distribution for {len(dataset)} samples...")
+    for batch in tqdm(loader, desc="Counting Labels", unit="batch"):
+        if batch is None or 'labels' not in batch or batch['labels'].numel() == 0:
+            continue # Skip empty or invalid batches
+
+        # batch['labels'] shape: (batch_size, num_labels)
+        # Sum positive labels across the batch dimension for each label
+        batch_label_sum = torch.sum(batch['labels'], dim=0) # Shape: (num_labels)
+        label_counts += batch_label_sum.long() # Accumulate counts
+
+    # Create DataFrame
+    distribution_df = pd.DataFrame({
+        'label_id': list(range(num_labels)),
+        'label_name': label_names,
+        'count': label_counts.numpy() # Convert tensor to numpy array
+    })
+
+    logging.info("Label distribution calculation complete.")
+    return distribution_df
+
 if __name__ == '__main__':
-    coco_root = "/home/soumen/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014" # Adjust this path
+    coco_root = "/raid/speech/soumen/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014" # Adjust this path
     # ds = COCODataset(root_dir=coco_root, frac=0.01, is_train=True, privileged_indices_set=set([]))
-    ds = COCODatasetOnDemand(root_dir=coco_root, frac=1.0, is_train=True, privileged_indices_set=set([]))
+    ds = COCODatasetOnDemand(root_dir=coco_root, frac=1.0, split_name="train", privileged_indices_set=set([]))
     print(f"Number of samples in dataset: {len(ds)}")
     print(ds[0])
-
+    df = get_label_distribution(ds, batch_size=64, num_workers=4)
+    print(df)
+    
+    
 

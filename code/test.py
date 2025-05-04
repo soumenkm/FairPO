@@ -50,8 +50,6 @@ class Tester:
         # or environment setup.
         self.config.coco_root = self.cli_config.coco_root
         self.config.index_dir = self.cli_config.index_dir if self.cli_config.index_dir else Path(self.config.coco_root) / '.index_cache' # Handle default index dir
-        self.config.wandb_project = self.cli_config.wandb_project # Use CLI value for logging destination
-        self.config.is_wandb = self.cli_config.is_wandb         # Use CLI value for enabling/disabling logging
         self.config.test_frac = self.cli_config.test_frac   # Use CLI value for test fraction
         self.config.batch_size = self.cli_config.batch_size
 
@@ -112,6 +110,7 @@ class Tester:
             ref_cls_weights_path=None, # Weights loaded from checkpoint's state_dict
             privileged_indices=self.privileged_indices, # Determined from loaded data
             non_privileged_indices=self.non_privileged_indices, # Determined from loaded data
+            loss_type=self.config.loss_type, # Use loss_type from checkpoint
             is_ref=self.config.is_ref_training, # Check if 'is_ref_training' was saved and True
             beta=self.config.beta, # Use getattr for backwards compat if beta wasn't saved
             epsilon=self.config.epsilon, # Use getattr for backwards compat
@@ -121,15 +120,12 @@ class Tester:
 
         # --- Load Model Weights ---
         self._load_model_weights() # Load weights from self.checkpoint
-        self.test_step = 0
+        self.val_step = 0
         
         # --- GRPO Alpha Weights (only for FairPO testing) ---
         if not self.config.is_ref_training:
             self.alpha_privileged = self.checkpoint.get('alpha_privileged', None)
             self.alpha_non_privileged = self.checkpoint.get('alpha_non_privileged', None)
-
-        # --- Setup WandB ---
-        self._setup_wandb()
 
     def _load_model_weights(self):
         """Loads model weights from the pre-loaded checkpoint dictionary."""
@@ -143,94 +139,175 @@ class Tester:
             logging.warning(f"Unexpected keys when loading weights: {unexpected_keys}")
         logging.info("Model weights loaded successfully.")
 
-    def _setup_wandb(self):
-        if self.config.is_wandb:
-            wandb.init(
-                project=self.config.wandb_project, # Use wandb_project here
-                name=self.config.run_name,
-                config=vars(self.config), # Log all argparse args
-            )
-            wandb.watch(self.model, log="all")
-            
-            # --- Define Custom Steps ---
-            wandb.define_metric("test/step") # Master step for testing
+    def _process_batch(self, batch: dict):
+        """
+        Moves batch to device, performs forward pass, and computes metrics.
 
-            # --- Link metrics to steps ---
-            # Test metrics use train/step
-            wandb.define_metric("test/*", step_metric="test/step")
-            logging.info(f"WandB initialized for project '{self.config.wandb_project}', run '{self.config.run_name}'.")
+        Returns:
+            Tuple of (results_dict, current_batch_size) or None if batch is invalid.
+            results_dict contains 'outputs', 'logits', 'loss', 'acc', 'f1', 'map', 'em'.
+        """
+        if batch is None or 'pixels' not in batch or batch['pixels'].numel() == 0:
+            logging.warning("Skipping empty or invalid batch.")
+            return None
 
-    def test(self):
+        pixels = batch['pixels'].to(self.device)
+        labels = batch['labels'].to(self.device)
+        current_batch_size = pixels.size(0)
+
+        output_dict = self.model(pixels=pixels, labels=labels)
+        return output_dict, current_batch_size
+    
+    # --- Helper to update epoch metrics accumulator ---
+    def _update_epoch_metrics(self, epoch_metrics: dict, results_dict: dict, batch_size: int):
+        """Updates the epoch metrics dictionary with results from a batch."""
+
+        # Accumulate Losses (weighted by batch size)
+        loss_comp = results_dict.get('loss')
+        if self.config.is_ref_training:
+            epoch_metrics['loss_sft'] += loss_comp['loss'].item() * batch_size
+        else:
+            # For FairPO, loss_components['loss'] was placeholder sum, use priv/non_priv
+            epoch_metrics['loss_priv'] += loss_comp['privileged'].item() * batch_size
+            epoch_metrics['loss_non_priv'] += loss_comp['non_privileged'].item() * batch_size
+            epoch_metrics['loss_total'] += (loss_comp.get('privileged') * self.alpha_privileged.item() + loss_comp.get('non_privileged') * self.alpha_non_privileged.item()) * batch_size
+
+        # Accumulate Accuracies (weighted by batch size)
+        acc_comp = results_dict.get('acc')
+        epoch_metrics['acc_overall'] += acc_comp['acc'] * batch_size
+        epoch_metrics['acc_priv'] += acc_comp['privileged'] * batch_size
+        epoch_metrics['acc_non_priv'] += acc_comp['non_privileged'] * batch_size
+        
+        # Accumulate EM (weighted by batch size)
+        em_comp = results_dict.get('em')
+        epoch_metrics['em'] += em_comp['em'] * batch_size
+        epoch_metrics['em_priv'] += em_comp['em_privileged'] * batch_size
+        epoch_metrics['em_non_priv'] += em_comp['em_non_privileged'] * batch_size
+
+        # Accumulate F1 Scores (weighted by batch size)
+        f1_comp = results_dict.get('f1')
+        epoch_metrics['f1'] += f1_comp['f1'] * batch_size
+        epoch_metrics['f1_priv'] += f1_comp['f1_privileged'] * batch_size
+        epoch_metrics['f1_non_priv'] += f1_comp['f1_non_privileged'] * batch_size
+
+        # Accumulate mAP Scores (weighted by batch size)
+        map_comp = results_dict.get('map')
+        epoch_metrics['map_overall'] += map_comp['mAP'] * batch_size
+        epoch_metrics['map_priv'] += map_comp['mAP_privileged'] * batch_size
+        epoch_metrics['map_non_priv'] += map_comp['mAP_non_privileged'] * batch_size
+    
+    # --- Helper to calculate epoch averages ---
+    def _calculate_epoch_averages(self, epoch_metrics: dict, processed_items: int) -> dict:
+        """Calculates average metrics for an epoch."""
+        avg_metrics = {}
+        if processed_items == 0: # Avoid division by zero
+            logging.warning("No items processed in epoch, metrics will be NaN.")
+            # Populate with NaNs based on expected keys in epoch_metrics
+            for k in epoch_metrics: avg_metrics[k.replace('loss_', 'avg_loss_').replace('acc_', 'avg_acc_').replace('f1_', 'avg_f1_').replace('map_', 'avg_map_').replace('em_', 'avg_em_')] = np.nan
+            return avg_metrics
+
+        for key, value in epoch_metrics.items():
+            avg_key = key.replace('loss_', 'avg_loss_').replace('acc_', 'avg_acc_').replace('f1_', 'avg_f1_').replace('map_', 'avg_map_').replace('em_', 'avg_em_')
+            avg_metrics[avg_key] = value / processed_items
+        
+        return avg_metrics
+    
+    # --- Validate Method ---
+    def _validate(self) -> dict:
+        """Runs validation loop and returns averaged metrics."""
         logging.info(f"Starting test...")
         self.model.eval()
-        test_metrics = {
+        # Initialize accumulator dict
+        val_epoch_metrics = {
             'loss_priv': 0.0, 'loss_non_priv': 0.0, 'loss_total': 0.0, 'loss_sft': 0.0,
-            'acc_priv': 0.0, 'acc_non_priv': 0.0, 'acc_overall': 0.0
+            'acc_overall': 0.0, 'acc_priv': 0.0, 'acc_non_priv': 0.0,
+            'em': 0.0, 'em_priv': 0.0, 'em_non_priv': 0.0,
+            'f1': 0.0, 'f1_priv': 0.0, 'f1_non_priv': 0.0,
+            'map_overall': 0.0, 'map_priv': 0.0, 'map_non_priv': 0.0
         }
         processed_items = 0
 
         with torch.no_grad():
-            test_iter = tqdm(self.test_loader, desc=f"Test", unit="batch", leave=False)
-            for batch in test_iter:
-                pixels = batch['pixels'].to(self.device)
-                labels = batch['labels'].to(self.device)
-                current_batch_size = pixels.size(0)
+            val_iter = tqdm(self.test_loader, desc=f"Test", unit="batch", leave=False)
+            for batch in val_iter:
+                processed_batch_info = self._process_batch(batch)
+                if processed_batch_info is None:
+                    continue
+                results_dict, current_batch_size = processed_batch_info
 
-                output_dict = self.model(pixels=pixels, labels=labels)
-                loss_components = output_dict['loss']
-                acc_components = output_dict['acc']
-
-                # Accumulate metrics (weighted sum by batch size)
-                if self.config.is_ref_training:
-                    loss = loss_components.get("loss", torch.tensor(np.nan, device=self.device))
-                    if not torch.isnan(loss): test_metrics['loss_sft'] += loss.item() * current_batch_size
-                else:
-                    loss_priv = loss_components.get("privileged", torch.tensor(np.nan, device=self.device))
-                    loss_non_priv = loss_components.get("non_privileged", torch.tensor(np.nan, device=self.device))
-                    test_metrics['loss_priv'] += loss_priv.item() * current_batch_size
-                    test_metrics['loss_non_priv'] += loss_non_priv.item() * current_batch_size
-
-                    # Use current training alphas for combined loss calculation (consistent reporting)
-                    alpha_p = self.alpha_privileged
-                    alpha_np = self.alpha_non_privileged
-                    combined_loss = alpha_p * loss_priv + alpha_np * loss_non_priv
-                    test_metrics['loss_total'] += combined_loss.item() * current_batch_size
-                
-                acc_priv_test = acc_components.get("privileged", np.nan)
-                acc_non_priv_test = acc_components.get("non_privileged", np.nan)
-                acc_overall_test = acc_components.get("acc", np.nan)
-
-                test_metrics['acc_priv'] += acc_priv_test * current_batch_size
-                test_metrics['acc_non_priv'] += acc_non_priv_test * current_batch_size
-                test_metrics['acc_overall'] += acc_overall_test * current_batch_size
-
+                # Use the helper to accumulate other metrics
+                self._update_epoch_metrics(val_epoch_metrics, results_dict, current_batch_size)
                 processed_items += current_batch_size
-                
-                tqdm_postfix = {
-                    'acc': acc_overall_test,
-                    'acc_priv': acc_priv_test,
-                    'acc_non_priv': acc_non_priv_test,
-                }
-                test_iter.set_postfix(**{k: f"{v:.3f}" if isinstance(v, float) else v for k, v in tqdm_postfix.items()})
-    
-        self.test_step += 1 # Increment test step counter *after* test loop
-        
-        # Calculate average test metrics and prefix keys
-        avg_test_metrics = {f"test/{k}": v / processed_items for k, v in test_metrics.items()}
 
-        logging.info(f"--- Test Results (Test Step {self.test_step}) ---")
+        # Calculate average validation metrics
+        avg_val_metrics_raw = self._calculate_epoch_averages(val_epoch_metrics, processed_items)
+
+        # Prefix keys with 'val/'
+        avg_val_metrics = {f"test/{k.replace('avg_', '')}": v for k, v in avg_val_metrics_raw.items()}
+
+        # Increment val_step AFTER calculations for this epoch
+        self.val_step += 1
+
+        self.model.train() # Set back to training mode
+        return avg_val_metrics # Return dict with 'val/' prefixes
+
+    # --- Test Method ---
+    def test(self):
+        """Main testing loop."""
+        # Validation
+        avg_val_metrics = self._validate() # Returns dict with 'val/...' prefixed keys
+
+        # Log epoch summary to console
+        self._log_epoch_summary_console(avg_val_metrics, mode='test')
+
+        logging.info("Testing finished.")
+
+    # --- Helper to log validation summary (console) ---
+    def _log_epoch_summary_console(self, avg_epoch_metrics: dict, mode: str):
+        """Logs the summary metrics for an epoch (test) to the console."""
+        if mode not in ['test']:
+            logging.warning(f"Invalid mode '{mode}' provided to _log_epoch_summary_console. Skipping log.")
+            return
+
+        # Determine prefix based on mode
+        prefix = f"{mode}/"
+        title_prefix = "Training" if mode == 'train' else "Testing"
+        step_info = f"(Train Step {self.train_step})" if mode == 'train' else f"(Test Step {self.val_step})"
+
+        logging.info(f"--- {title_prefix} Results {step_info} ---")
+
+        # Log Losses
         if self.config.is_ref_training:
-            logging.info(f"  Avg Loss (SFT): {avg_test_metrics.get('test/loss_sft', np.nan):.4f}")
+            # SFT mode only has one loss
+            logging.info(f"  Avg Loss (SFT): {avg_epoch_metrics.get(f'{prefix}loss_sft'):.4f}")
         else:
-            logging.info(f"  Avg Loss (Priv): {avg_test_metrics.get('test/loss_priv', np.nan):.4f}")
-            logging.info(f"  Avg Loss (Non-Priv): {avg_test_metrics.get('test/loss_non_priv', np.nan):.4f}")
-            logging.info(f"  Avg Loss (Combined): {avg_test_metrics.get('test/loss_total', np.nan):.4f}") # Note: uses 'loss_total' key
-        logging.info(f"  Avg Acc (Overall): {avg_test_metrics.get('test/acc_overall', np.nan):.4f}")
-        logging.info(f"  Avg Acc (Priv): {avg_test_metrics.get('test/acc_priv', np.nan):.4f}")
-        logging.info(f"  Avg Acc (Non-Priv): {avg_test_metrics.get('test/acc_non_priv', np.nan):.4f}")
-        logging.info(f"---------------------------------------------")
+            # FairPO mode has component losses
+            logging.info(f"  Avg Loss (Priv): {avg_epoch_metrics.get(f'{prefix}loss_priv'):.4f}")
+            logging.info(f"  Avg Loss (Non-Priv): {avg_epoch_metrics.get(f'{prefix}loss_non_priv'):.4f}")
+            # The 'loss_total' key should store the combined loss used for optimization/evaluation
+            logging.info(f"  Avg Loss (Combined): {avg_epoch_metrics.get(f'{prefix}loss_total'):.4f}")
 
-        return avg_test_metrics
+        # Log Accuracies
+        logging.info(f"  Avg Acc (Overall): {avg_epoch_metrics.get(f'{prefix}acc_overall'):.4f}")
+        logging.info(f"  Avg Acc (Priv): {avg_epoch_metrics.get(f'{prefix}acc_priv'):.4f}")
+        logging.info(f"  Avg Acc (Non-Priv): {avg_epoch_metrics.get(f'{prefix}acc_non_priv'):.4f}")
+        
+        # Log Exact Match (EM) Scores
+        logging.info(f"  Avg EM (Overall): {avg_epoch_metrics.get(f'{prefix}em'):.4f}")
+        logging.info(f"  Avg EM (Priv): {avg_epoch_metrics.get(f'{prefix}em_priv'):.4f}")
+        logging.info(f"  Avg EM (Non-Priv): {avg_epoch_metrics.get(f'{prefix}em_non_priv'):.4f}")
+
+        # Log F1 Scores
+        logging.info(f"  Avg F1 (Overall): {avg_epoch_metrics.get(f'{prefix}f1'):.4f}")
+        logging.info(f"  Avg F1 (Priv): {avg_epoch_metrics.get(f'{prefix}f1_priv'):.4f}")
+        logging.info(f"  Avg F1 (Non-Priv): {avg_epoch_metrics.get(f'{prefix}f1_non_priv'):.4f}")
+
+        # Log mAP Scores
+        logging.info(f"  Avg mAP (Overall): {avg_epoch_metrics.get(f'{prefix}map_overall'):.4f}")
+        logging.info(f"  Avg mAP (Priv): {avg_epoch_metrics.get(f'{prefix}map_priv'):.4f}")
+        logging.info(f"  Avg mAP (Non-Priv): {avg_epoch_metrics.get(f'{prefix}map_non_priv'):.4f}")
+
+        logging.info(f"---------------------------------------------")
 
 def main():
     parser = argparse.ArgumentParser(description="Test FairPO/SFT Model for Multi-Label Classification")
@@ -242,17 +319,14 @@ def main():
     default_coco_root = f"{user_dir}/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014"
 
     # --- Required Argument ---
-    parser.add_argument('--checkpoint_path', type=str, default="output/ckpt/fairpo_model/FairPO-train/FairPO_ep5_lr5e-05_eta0.0001_eps0.1_beta2.0/checkpoint_epoch_2.pth", help='Path to the model checkpoint file to test')
+    ckpt_path = "output/ckpt/FairPO-train/SFT_lr5e-05_frac1.00_ep5/checkpoint_best.pth"
+    parser.add_argument('--checkpoint_path', type=str, default=ckpt_path, help='Path to the model checkpoint file to test')
 
     # --- Essential CLI Arguments for Test Setup ---
     parser.add_argument('--coco_root', type=str, default=default_coco_root, help='Root directory of the COCO dataset (may override checkpoint config if needed)')
     parser.add_argument('--index_dir', type=str, default=None, help='Directory for dataset index files (overrides checkpoint default if provided)')
-    parser.add_argument('--test_frac', type=float, default=1.0, help='Fraction of test data (overrides checkpoint default)')
+    parser.add_argument('--test_frac', type=float, default=0.1, help='Fraction of test data (overrides checkpoint default)')
     parser.add_argument('--batch_size', type=int, default=32, help='Testing batch size (overrides checkpoint default)')
-
-    # --- WandB Arguments (Control Test Logging) ---
-    parser.add_argument('--wandb_project', type=str, default="FairPO-test", help='WandB project name for logging test results')
-    parser.add_argument('--is_wandb', default=False, help='Enable WandB logging for this test run')
 
     args = parser.parse_args()
 
