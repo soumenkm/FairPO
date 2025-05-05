@@ -14,7 +14,7 @@ import sys
 from typing import Dict, Any, Tuple, Optional # Added for type hinting
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "6" # Example default
+    os.environ["CUDA_VISIBLE_DEVICES"] = "5" # Example default
 
 # Import necessary components from other files
 from models import VisionModelForCLS
@@ -599,10 +599,12 @@ def main():
     parser.add_argument('--ref_cls_weights_path', type=str, default=ref_cls_weights_path, help='Path to SFT pre-trained reference classifier weights (REQUIRED for FairPO training/testing)') # Make default None
 
     # Model & Data
+    priv_index = "78, 70, 12, 21, 76, 79, 52, 54, 68, 18, 31, 47, 51, 10, 11, 49, 64, 22, 50, 19"
+    # priv_index = "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19" # !IMP: CHANGE THIS
     parser.add_argument('--model_name', type=str, default='google/vit-base-patch16-224', help='Vision Transformer model name')
     parser.add_argument('--train_frac', type=float, default=1.0, help='Fraction of training data (0.0 to 1.0)') # !IMP: CHANGE THIS
     parser.add_argument('--val_frac', type=float, default=1.0, help='Fraction of validation data (0.0 to 1.0)') # !IMP: CHANGE THIS
-    parser.add_argument('--privileged_indices', type=str, default="78, 70, 12, 21, 76, 79, 52, 54, 68, 18, 31, 47, 51, 10, 11, 49, 64, 22, 50, 19", help='Comma-separated privileged label indices')
+    parser.add_argument('--privileged_indices', type=str, default=priv_index, help='Comma-separated privileged label indices')
     parser.add_argument('--force_regenerate_index', default=False, help='Force regeneration of dataset index')
 
     # Training Hyperparameters
@@ -610,7 +612,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='Training batch size')
     parser.add_argument('--learning_rate', type=float, default=5e-4, help='Optimizer learning rate') 
     parser.add_argument('--weight_decay', type=float, default=0.1, help='Optimizer weight decay')
-    parser.add_argument('--beta', type=float, default=1.0, help='DPO beta hyperparameter') 
+    parser.add_argument('--beta', type=float, default=2.0, help='DPO beta hyperparameter') 
     parser.add_argument('--epsilon', type=float, default=0.01, help='Constraint slack epsilon')
     parser.add_argument('--eta_alpha', type=float, default=0.0001, help='Learning rate for GRPO alpha weights')
     parser.add_argument('--grad_clip', type=float, default=10.0, help='Gradient clipping value (0 to disable)')
@@ -624,7 +626,7 @@ def main():
     parser.add_argument('--cpu', default=False, help='Force use CPU')
 
     # WandB
-    parser.add_argument('--wandb_project', type=str, default="FairPO-TailPart", help='WandB project name (disable if blank)')
+    parser.add_argument('--wandb_project', type=str, default="FairPO-Ablation", help='WandB project name (disable if blank)')
     parser.add_argument('--is_wandb', type=bool, default=True, help='Whether to use WandB for logging') # !IMP: CHANGE THIS
     parser.add_argument('--run_name', type=str, default=None, help='Custom WandB run name (e.g., FairPO_b64_lr1e-5_eta0.01)')
 

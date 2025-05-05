@@ -79,8 +79,72 @@ class Metrics:
         if num_pairs == 0:
             return torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
         else:
-            return total_priv_loss / num_pairs
+            return total_priv_loss / num_pairs 
 
+    @staticmethod
+    def _compute_privileged_loss_simpo(
+        prob_scores: torch.Tensor,
+        # ref_prob_scores: torch.Tensor, # Not needed for SimPO
+        labels: torch.Tensor,
+        privileged_indices: List[int],
+        num_labels: int,
+        beta: float,            # SimPO still uses beta scaling
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Internal helper for SimPO-inspired privileged loss.
+        Reference-free comparison between positive privileged labels and confusing negatives.
+
+        Args:
+            prob_scores: Current model's predicted probabilities. Shape (b, c).
+            labels: Ground truth labels. Shape (b, c).
+            privileged_indices: List of indices for the privileged group P.
+            num_labels: Total number of labels (c).
+            beta: Scaling factor (like in SimPO paper).
+            device: The torch device.
+
+        Returns:
+            Scalar privileged loss averaged over valid (l, k) pairs.
+        """
+        batch_size = prob_scores.shape[0]
+        total_priv_loss = 0.0
+        num_pairs = 0
+        gamma = 0.0
+
+        if not privileged_indices:
+            return torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
+
+        for i in range(batch_size):
+            current_scores_i = prob_scores[i]
+            labels_i = labels[i]
+
+            positive_priv_labels = [
+                l for l in privileged_indices if 0 <= l < num_labels and labels_i[l] == 1
+            ]
+
+            for l in positive_priv_labels:
+                m_il = current_scores_i[l]
+                confusing_negatives = [
+                    k for k in range(num_labels)
+                    if labels_i[k] == 0 and current_scores_i[k] >= m_il
+                ]
+
+                for k in confusing_negatives:
+                    m_ik = current_scores_i[k]
+
+                    log_term_l = torch.log(m_il + Metrics.eps)
+                    log_term_k = torch.log(m_ik + Metrics.eps)
+                    h_w = log_term_l - log_term_k
+                    loss_term = -F.logsigmoid(beta * h_w - gamma)
+
+                    total_priv_loss += loss_term
+                    num_pairs += 1
+
+        if num_pairs == 0:
+            return torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
+        else:
+            return total_priv_loss / num_pairs
+    
     @staticmethod
     def _compute_non_privileged_loss(
         prob_scores: torch.Tensor,
@@ -158,6 +222,15 @@ class Metrics:
                 loss_components["privileged"] = Metrics._compute_privileged_loss_dpo(
                     prob_scores=prob_scores,
                     ref_prob_scores=ref_prob_scores,
+                    labels=labels,
+                    privileged_indices=privileged_indices,
+                    num_labels=num_labels,
+                    beta=beta,
+                    device=device
+                )
+            elif loss_type == "simpo":
+                loss_components["privileged"] = Metrics._compute_privileged_loss_simpo(
+                    prob_scores=prob_scores,
                     labels=labels,
                     privileged_indices=privileged_indices,
                     num_labels=num_labels,
@@ -428,7 +501,7 @@ class Metrics:
                 ap_scores.append(ap)
 
         if not ap_scores:
-            return float('nan')
+            return 0.0
         else:
             return float(np.mean(ap_scores))
 
@@ -459,9 +532,9 @@ class Metrics:
         indices_tensor = torch.tensor(indices, device=device, dtype=torch.long)
         valid_indices = indices_tensor[indices_tensor < prob_scores.shape[1]]
         if len(valid_indices) != len(indices):
-             print(f"Warning: {len(indices) - len(valid_indices)} mAP subset indices out of bounds ignored.")
-             if len(valid_indices) == 0: return float('nan')
-             indices_tensor = valid_indices
+            print(f"Warning: {len(indices) - len(valid_indices)} mAP subset indices out of bounds ignored.")
+            if len(valid_indices) == 0: return float('nan')
+            indices_tensor = valid_indices
 
         scores_subset = prob_scores[:, indices_tensor]
         labels_subset = labels[:, indices_tensor]
