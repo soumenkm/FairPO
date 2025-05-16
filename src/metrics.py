@@ -1,26 +1,35 @@
-# metrics.py
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import average_precision_score, f1_score, precision_recall_fscore_support
+from sklearn.metrics import average_precision_score, f1_score
 import numpy as np
 from typing import List, Dict, Optional, Tuple, Union
+import random
 
 class Metrics:
     """
     A collection of static methods for calculating losses and accuracies
     relevant to the FairPO framework and multi-label classification.
-    Loss and Accuracy computations are separated into distinct static methods.
+    Loss and accuracy computations are separated into distinct static methods.
     """
-    eps = 1e-8 # Class attribute for stability epsilon
+    eps = 1e-8
 
-    # --- Internal Loss Helpers ---
     @staticmethod
     def _compute_bce_loss(
         prob_scores: torch.Tensor,
         labels: torch.Tensor,
         reduction: str = 'mean'
     ) -> torch.Tensor:
-        """Internal helper for standard Binary Cross-Entropy loss."""
+        """
+        Computes standard Binary Cross-Entropy loss with clamping for numerical stability.
+
+        Args:
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            reduction (str): Reduction method ('mean', 'sum', or 'none').
+
+        Returns:
+            torch.Tensor: BCE loss tensor.
+        """
         prob_scores_clamped = prob_scores.clamp(min=Metrics.eps, max=1.0 - Metrics.eps)
         loss = F.binary_cross_entropy(
             prob_scores_clamped,
@@ -39,7 +48,22 @@ class Metrics:
         beta: float,
         device: torch.device
     ) -> torch.Tensor:
-        """Internal helper for DPO-inspired privileged loss."""
+        """
+        Computes the DPO-inspired privileged loss by comparing positive privileged labels
+        against confusing negatives using reference and current model scores.
+
+        Args:
+            prob_scores (torch.Tensor): Current model probabilities (batch_size, num_labels).
+            ref_prob_scores (torch.Tensor): Reference model probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            privileged_indices (List[int]): List of privileged label indices.
+            num_labels (int): Total number of labels.
+            beta (float): Scaling factor.
+            device (torch.device): Torch device.
+
+        Returns:
+            torch.Tensor: Averaged privileged loss scalar tensor.
+        """
         batch_size = prob_scores.shape[0]
         total_priv_loss = 0.0
         num_pairs = 0
@@ -84,27 +108,26 @@ class Metrics:
     @staticmethod
     def _compute_privileged_loss_simpo(
         prob_scores: torch.Tensor,
-        # ref_prob_scores: torch.Tensor, # Not needed for SimPO
         labels: torch.Tensor,
         privileged_indices: List[int],
         num_labels: int,
-        beta: float,            # SimPO still uses beta scaling
+        beta: float,
         device: torch.device
     ) -> torch.Tensor:
         """
-        Internal helper for SimPO-inspired privileged loss.
-        Reference-free comparison between positive privileged labels and confusing negatives.
+        Computes the SimPO-inspired privileged loss without reference scores,
+        comparing positive privileged labels against confusing negatives.
 
         Args:
-            prob_scores: Current model's predicted probabilities. Shape (b, c).
-            labels: Ground truth labels. Shape (b, c).
-            privileged_indices: List of indices for the privileged group P.
-            num_labels: Total number of labels (c).
-            beta: Scaling factor (like in SimPO paper).
-            device: The torch device.
+            prob_scores (torch.Tensor): Current model probabilities (batch_size, num_labels).
+            labels (torch.Tensor): Ground truth labels.
+            privileged_indices (List[int]): List of privileged label indices.
+            num_labels (int): Total number of labels.
+            beta (float): Scaling factor.
+            device (torch.device): Torch device.
 
         Returns:
-            Scalar privileged loss averaged over valid (l, k) pairs.
+            torch.Tensor: Averaged privileged loss scalar tensor.
         """
         batch_size = prob_scores.shape[0]
         total_priv_loss = 0.0
@@ -144,6 +167,281 @@ class Metrics:
             return torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
         else:
             return total_priv_loss / num_pairs
+        
+    @staticmethod
+    def _compute_privileged_loss_dpo_conditional(
+        prob_scores: torch.Tensor,
+        ref_prob_scores: torch.Tensor,
+        labels: torch.Tensor,
+        privileged_indices: List[int],
+        num_labels: int,
+        beta: float,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Computes conditional DPO privileged loss applying DPO loss if confusing examples
+        exist, else falls back to BCE loss for each privileged label.
+
+        Args:
+            prob_scores (torch.Tensor): Current model probabilities.
+            ref_prob_scores (torch.Tensor): Reference model probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            privileged_indices (List[int]): Privileged label indices.
+            num_labels (int): Total labels count.
+            beta (float): Scaling factor.
+            device (torch.device): Torch device.
+
+        Returns:
+            torch.Tensor: Averaged privileged loss tensor.
+        """
+        batch_size = prob_scores.shape[0]
+        total_loss_for_privileged_labels = 0.0
+        num_privileged_labels_processed = 0
+
+        if not privileged_indices:
+            return torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
+
+        for i in range(batch_size):
+            current_scores_i = prob_scores[i]
+            ref_scores_i = ref_prob_scores[i]
+            labels_i = labels[i]
+
+            for l_idx in privileged_indices:
+                if not (0 <= l_idx < num_labels):
+                    continue 
+                
+                num_privileged_labels_processed += 1
+                y_il = labels_i[l_idx]
+                m_il_current = current_scores_i[l_idx]
+
+                confusing_set_k_indices = []
+                is_positive_case = False
+
+                if y_il == 1:
+                    is_positive_case = True
+                    confusing_set_k_indices = [
+                        k for k in range(num_labels)
+                        if labels_i[k] == 0 and current_scores_i[k] >= m_il_current and k != l_idx
+                    ]
+                else:
+                    confusing_set_k_indices = [
+                        k for k in range(num_labels)
+                        if labels_i[k] == 1 and current_scores_i[k] <= m_il_current and k != l_idx
+                    ]
+                
+                if confusing_set_k_indices:
+                    k_sampled_idx = random.choice(confusing_set_k_indices)
+                    m_ik_current = current_scores_i[k_sampled_idx]
+                    
+                    m_il_current_clamped = m_il_current.clamp(min=Metrics.eps, max=1.0 - Metrics.eps)
+                    m_ik_current_clamped = m_ik_current.clamp(min=Metrics.eps, max=1.0 - Metrics.eps)
+                    ref_m_il_clamped = ref_scores_i[l_idx].clamp(min=Metrics.eps, max=1.0 - Metrics.eps)
+                    ref_m_ik_clamped = ref_scores_i[k_sampled_idx].clamp(min=Metrics.eps, max=1.0 - Metrics.eps)
+
+                    if is_positive_case:
+                        log_term_l = torch.log(m_il_current_clamped / ref_m_il_clamped)
+                        log_term_k = torch.log(m_ik_current_clamped / ref_m_ik_clamped)
+                        h_val = log_term_l - log_term_k
+                    else:
+                        log_term_k_prime = torch.log(m_ik_current_clamped / ref_m_ik_clamped)
+                        log_term_l_prime = torch.log(m_il_current_clamped / ref_m_il_clamped)
+                        h_val = log_term_k_prime - log_term_l_prime
+                    
+                    loss_pref = -F.logsigmoid(beta * h_val)
+                    total_loss_for_privileged_labels += loss_pref
+                else:
+                    score_l = current_scores_i[l_idx].unsqueeze(0)
+                    label_l = labels_i[l_idx].unsqueeze(0).to(torch.float32)
+                    bce_loss_l = Metrics._compute_bce_loss(score_l, label_l, reduction='sum')
+                    total_loss_for_privileged_labels += bce_loss_l
+        
+        if num_privileged_labels_processed == 0:
+            return torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
+        else:
+            return total_loss_for_privileged_labels / num_privileged_labels_processed
+
+    @staticmethod
+    def _compute_privileged_loss_simpo_conditional(
+        prob_scores: torch.Tensor,
+        labels: torch.Tensor,
+        privileged_indices: List[int],
+        num_labels: int,
+        beta: float,
+        gamma_simpo: float,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Computes conditional SimPO privileged loss applying SimPO loss if confusing
+        examples exist, else uses BCE loss for privileged labels.
+
+        Args:
+            prob_scores (torch.Tensor): Current model probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            privileged_indices (List[int]): Privileged label indices.
+            num_labels (int): Total labels count.
+            beta (float): Scaling factor.
+            gamma_simpo (float): Margin parameter.
+            device (torch.device): Torch device.
+
+        Returns:
+            torch.Tensor: Averaged privileged loss tensor.
+        """
+        batch_size = prob_scores.shape[0]
+        total_loss_for_privileged_labels = 0.0
+        num_privileged_labels_processed = 0
+
+        if not privileged_indices:
+            return torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
+
+        for i in range(batch_size):
+            current_scores_i = prob_scores[i]
+            labels_i = labels[i]
+
+            for l_idx in privileged_indices:
+                if not (0 <= l_idx < num_labels): continue
+                num_privileged_labels_processed += 1
+                y_il = labels_i[l_idx]
+                m_il_current = current_scores_i[l_idx]
+
+                confusing_set_k_indices = []
+                is_positive_case = False
+
+                if y_il == 1:
+                    is_positive_case = True
+                    confusing_set_k_indices = [
+                        k for k in range(num_labels)
+                        if labels_i[k] == 0 and current_scores_i[k] >= m_il_current and k != l_idx
+                    ]
+                else:
+                    confusing_set_k_indices = [
+                        k for k in range(num_labels)
+                        if labels_i[k] == 1 and current_scores_i[k] <= m_il_current and k != l_idx
+                    ]
+                
+                if confusing_set_k_indices:
+                    k_sampled_idx = random.choice(confusing_set_k_indices)
+                    m_ik_current = current_scores_i[k_sampled_idx]
+
+                    m_il_clamped = m_il_current.clamp(min=Metrics.eps)
+                    m_ik_clamped = m_ik_current.clamp(min=Metrics.eps)
+
+                    if is_positive_case:
+                        log_score_preferred = torch.log(m_il_clamped)
+                        log_score_dispreferred = torch.log(m_ik_clamped)
+                    else:
+                        log_score_preferred = torch.log(m_ik_clamped)
+                        log_score_dispreferred = torch.log(m_il_clamped)
+                    
+                    h_val = log_score_preferred - log_score_dispreferred
+                    loss_pref = -F.logsigmoid(beta * h_val - gamma_simpo)
+                    total_loss_for_privileged_labels += loss_pref
+                else:
+                    score_l = current_scores_i[l_idx].unsqueeze(0)
+                    label_l = labels_i[l_idx].unsqueeze(0).to(torch.float32)
+                    bce_loss_l = Metrics._compute_bce_loss(score_l, label_l, reduction='sum')
+                    total_loss_for_privileged_labels += bce_loss_l
+        
+        if num_privileged_labels_processed == 0:
+            return torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
+        else:
+            return total_loss_for_privileged_labels / num_privileged_labels_processed
+
+    @staticmethod
+    def _compute_privileged_loss_cpo_conditional(
+        prob_scores: torch.Tensor,
+        labels: torch.Tensor,
+        privileged_indices: List[int],
+        num_labels: int,
+        beta: float,
+        lambda_cpo_nll: float,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Computes conditional CPO privileged loss with preference term applied if confusing
+        examples exist and unconditional BCE applied to all privileged labels.
+
+        Args:
+            prob_scores (torch.Tensor): Current model probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            privileged_indices (List[int]): Privileged label indices.
+            num_labels (int): Total labels count.
+            beta (float): Scaling factor.
+            lambda_cpo_nll (float): Weighting factor for NLL component.
+            device (torch.device): Torch device.
+
+        Returns:
+            torch.Tensor: Final combined CPO loss.
+        """
+        batch_size = prob_scores.shape[0]
+        total_preference_loss_sum = 0.0
+        num_preference_pairs_processed_for_avg = 0
+
+        if privileged_indices:
+            for i in range(batch_size):
+                current_scores_i = prob_scores[i]
+                labels_i = labels[i]
+
+                for l_idx in privileged_indices:
+                    if not (0 <= l_idx < num_labels): continue
+                    
+                    y_il = labels_i[l_idx]
+                    m_il_current = current_scores_i[l_idx]
+                    confusing_set_k_indices = []
+                    is_positive_case_for_pref = False
+
+                    if y_il == 1:
+                        is_positive_case_for_pref = True
+                        confusing_set_k_indices = [
+                            k for k in range(num_labels)
+                            if labels_i[k] == 0 and current_scores_i[k] >= m_il_current and k != l_idx
+                        ]
+                    else:
+                        confusing_set_k_indices = [
+                            k for k in range(num_labels)
+                            if labels_i[k] == 1 and current_scores_i[k] <= m_il_current and k != l_idx
+                        ]
+
+                    if confusing_set_k_indices:
+                        k_sampled_idx = random.choice(confusing_set_k_indices)
+                        m_ik_current = current_scores_i[k_sampled_idx]
+
+                        m_il_clamped = m_il_current.clamp(min=Metrics.eps)
+                        m_ik_clamped = m_ik_current.clamp(min=Metrics.eps)
+
+                        if is_positive_case_for_pref:
+                            log_score_preferred = torch.log(m_il_clamped)
+                            log_score_dispreferred = torch.log(m_ik_clamped)
+                        else:
+                            log_score_preferred = torch.log(m_ik_clamped)
+                            log_score_dispreferred = torch.log(m_il_clamped)
+                        
+                        h_val = log_score_preferred - log_score_dispreferred
+                        preference_loss_term = -F.logsigmoid(beta * h_val)
+                        total_preference_loss_sum += preference_loss_term
+                        num_preference_pairs_processed_for_avg += 1
+            
+        avg_preference_loss = (total_preference_loss_sum / num_preference_pairs_processed_for_avg) \
+                              if num_preference_pairs_processed_for_avg > 0 \
+                              else torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
+
+        avg_nll_loss_for_privileged = torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
+        if privileged_indices:
+            priv_indices_tensor_for_nll = torch.tensor(
+                [idx for idx in privileged_indices if 0 <= idx < num_labels], 
+                device=device, dtype=torch.long
+            )
+            if priv_indices_tensor_for_nll.numel() > 0:
+                scores_privileged_subset = prob_scores[:, priv_indices_tensor_for_nll]
+                labels_privileged_subset = labels[:, priv_indices_tensor_for_nll]
+                avg_nll_loss_for_privileged = Metrics._compute_bce_loss(
+                    scores_privileged_subset, 
+                    labels_privileged_subset, 
+                    reduction='mean' 
+                )
+        
+        final_cpo_loss = avg_preference_loss + lambda_cpo_nll * avg_nll_loss_for_privileged
+        
+        return final_cpo_loss
     
     @staticmethod
     def _compute_non_privileged_loss(
@@ -154,18 +452,31 @@ class Metrics:
         epsilon: float,
         device: torch.device
     ) -> torch.Tensor:
-        """Internal helper for constrained non-privileged loss."""
+        """
+        Computes constrained non-privileged loss as hinge loss between current and
+        reference BCE losses.
+
+        Args:
+            prob_scores (torch.Tensor): Current model probabilities.
+            ref_prob_scores (torch.Tensor): Reference model probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            non_privileged_indices (List[int]): Non-privileged label indices.
+            epsilon (float): Margin parameter.
+            device (torch.device): Torch device.
+
+        Returns:
+            torch.Tensor: Averaged hinge loss scalar tensor.
+        """
         if not non_privileged_indices:
              return torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
 
         non_priv_indices_tensor = torch.tensor(non_privileged_indices, device=device, dtype=torch.long)
-        # Ensure indices are valid before slicing
         valid_indices = non_priv_indices_tensor[non_priv_indices_tensor < prob_scores.shape[1]]
         if len(valid_indices) != len(non_privileged_indices):
             print(f"Warning: {len(non_privileged_indices) - len(valid_indices)} non-privileged indices out of bounds and ignored.")
             if len(valid_indices) == 0:
                 return torch.tensor(0.0, device=device, requires_grad=prob_scores.requires_grad)
-            non_priv_indices_tensor = valid_indices # Use only valid indices
+            non_priv_indices_tensor = valid_indices
 
         m_nonpriv = prob_scores[:, non_priv_indices_tensor]
         ref_m_nonpriv = ref_prob_scores[:, non_priv_indices_tensor]
@@ -192,14 +503,21 @@ class Metrics:
         loss_type: str
     ) -> Optional[Dict[str, torch.Tensor]]:
         """
-        Computes only the relevant loss components based on the mode.
+        Computes loss components based on training mode and loss type.
 
         Args:
-            (Same as compute_all_metrics)
+            prob_scores (torch.Tensor): Current model probabilities.
+            ref_prob_scores (Optional[torch.Tensor]): Reference model probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            privileged_indices (List[int]): Privileged label indices.
+            non_privileged_indices (List[int]): Non-privileged label indices.
+            is_ref_mode (bool): Whether in reference mode (only BCE loss).
+            beta (float): Scaling factor for privileged losses.
+            epsilon (float): Margin for constrained losses.
+            loss_type (str): One of 'dpo', 'simpo', 'cpo'.
 
         Returns:
-            loss_components (Dict[str, torch.Tensor] or None): Dictionary of loss tensors.
-            Returns None if labels are not provided.
+            Optional[Dict[str, torch.Tensor]]: Dictionary with loss components or None if labels are None.
         """
         if labels is None:
             return None
@@ -219,7 +537,7 @@ class Metrics:
                 raise ValueError("ref_prob_scores must be provided when is_ref_mode is False.")
 
             if loss_type == "dpo":
-                loss_components["privileged"] = Metrics._compute_privileged_loss_dpo(
+                loss_components["privileged"] = Metrics._compute_privileged_loss_dpo_conditional(
                     prob_scores=prob_scores,
                     ref_prob_scores=ref_prob_scores,
                     labels=labels,
@@ -229,7 +547,16 @@ class Metrics:
                     device=device
                 )
             elif loss_type == "simpo":
-                loss_components["privileged"] = Metrics._compute_privileged_loss_simpo(
+                loss_components["privileged"] = Metrics._compute_privileged_loss_simpo_conditional(
+                    prob_scores=prob_scores,
+                    labels=labels,
+                    privileged_indices=privileged_indices,
+                    num_labels=num_labels,
+                    beta=beta,
+                    device=device
+                )
+            elif loss_type == "cpo":
+                loss_components["privileged"] = Metrics._compute_privileged_loss_cpo_conditional(
                     prob_scores=prob_scores,
                     labels=labels,
                     privileged_indices=privileged_indices,
@@ -248,20 +575,27 @@ class Metrics:
                 epsilon=epsilon,
                 device=device
             )
-            # Provide a 'loss' key as the raw sum for convenience during training logging/combination
-            # The actual weighted combination happens in the trainer.
             loss_components["loss"] = loss_components["privileged"] + loss_components["non_privileged"]
 
         return loss_components
 
-    # --- Internal Accuracy Helpers ---
     @staticmethod
     def _compute_accuracy(
         prob_scores: torch.Tensor,
         labels: torch.Tensor,
         threshold: float = 0.5
     ) -> float:
-        """Internal helper for overall element-wise accuracy."""
+        """
+        Computes overall element-wise accuracy for multi-label classification.
+
+        Args:
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            threshold (float): Threshold to convert probabilities to binary predictions.
+
+        Returns:
+            float: Accuracy score.
+        """
         if prob_scores.numel() == 0 or labels.numel() == 0: return float('nan')
         labels_float = labels.to(torch.float32)
         predictions = (prob_scores >= threshold).to(torch.float32)
@@ -277,22 +611,31 @@ class Metrics:
         threshold: float,
         device: torch.device
     ) -> float:
-        """Internal helper for subset accuracy."""
+        """
+        Computes element-wise accuracy restricted to a subset of labels.
+
+        Args:
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            indices (List[int]): Label indices to compute accuracy on.
+            threshold (float): Threshold to convert probabilities to binary predictions.
+            device (torch.device): Torch device.
+
+        Returns:
+            float: Accuracy score on subset.
+        """
         if not indices: return float('nan')
         indices_tensor = torch.tensor(indices, device=device, dtype=torch.long)
-        # Ensure indices are valid before slicing
         valid_indices = indices_tensor[indices_tensor < prob_scores.shape[1]]
         if len(valid_indices) != len(indices):
-             print(f"Warning: {len(indices) - len(valid_indices)} subset accuracy indices out of bounds and ignored.")
-             if len(valid_indices) == 0: return float('nan')
-             indices_tensor = valid_indices # Use only valid indices
+            print(f"Warning: {len(indices) - len(valid_indices)} subset accuracy indices out of bounds and ignored.")
+            if len(valid_indices) == 0: return float('nan')
+            indices_tensor = valid_indices
 
         scores_subset = prob_scores[:, indices_tensor]
         labels_subset = labels[:, indices_tensor]
         accuracy = Metrics._compute_accuracy(scores_subset, labels_subset, threshold)
         return accuracy
-
-    # --- Public Static Methods for Accuracy ---
 
     @staticmethod
     def compute_accuracy_components(
@@ -303,14 +646,17 @@ class Metrics:
         accuracy_threshold: float = 0.5
     ) -> Optional[Dict[str, float]]:
         """
-        Computes all relevant accuracy components.
+        Computes overall, privileged, and non-privileged accuracy components.
 
         Args:
-             (Same as compute_all_metrics, minus loss-specific params like beta, epsilon)
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            privileged_indices (List[int]): Privileged label indices.
+            non_privileged_indices (List[int]): Non-privileged label indices.
+            accuracy_threshold (float): Threshold for binary predictions.
 
         Returns:
-            accuracy_components (Dict[str, float] or None): Dictionary of accuracy floats.
-            Returns None if labels are not provided.
+            Optional[Dict[str, float]]: Dictionary of accuracy components or None if labels are None.
         """
         if labels is None:
             return None
@@ -329,8 +675,6 @@ class Metrics:
         )
 
         return accuracy_components
-    
-    # --- Internal Exact Match Accuracy Helpers ---
 
     @staticmethod
     def _compute_exact_match_accuracy(
@@ -339,23 +683,25 @@ class Metrics:
         threshold: float = 0.5
     ) -> float:
         """
-        (Internal Helper) Computes overall exact match accuracy (ratio of instances
-        where predicted labels perfectly match true labels).
+        Computes exact match accuracy, where predicted labels exactly match true labels.
+
+        Args:
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            threshold (float): Threshold for binary predictions.
+
+        Returns:
+            float: Exact match accuracy.
         """
         if prob_scores.numel() == 0 or labels.numel() == 0: return float('nan')
         if prob_scores.shape != labels.shape:
             print("Warning: Shape mismatch for exact match accuracy.")
             return float('nan')
 
-        # Get binary predictions and ensure labels are integer type for comparison
         predictions_binary = (prob_scores >= threshold).int()
         labels_binary = labels.int()
 
-        # Compare each row (instance) for exact match
-        # torch.all(tensor, dim=1) checks if all elements along dimension 1 (columns) are True
         matches = torch.all(predictions_binary == labels_binary, dim=1)
-
-        # Calculate the ratio of matching instances
         exact_match_ratio = matches.float().mean().item()
         return exact_match_ratio
 
@@ -368,29 +714,32 @@ class Metrics:
         device: torch.device
     ) -> float:
         """
-        (Internal Helper) Computes exact match accuracy considering only a subset of labels.
+        Computes exact match accuracy considering only a subset of labels.
+
+        Args:
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            indices (List[int]): Label indices for subset.
+            threshold (float): Threshold for binary predictions.
+            device (torch.device): Torch device.
+
+        Returns:
+            float: Exact match accuracy on subset.
         """
         if not indices: return float('nan')
         indices_tensor = torch.tensor(indices, device=device, dtype=torch.long)
-        # Ensure indices are valid before slicing
         valid_indices = indices_tensor[indices_tensor < prob_scores.shape[1]]
         if len(valid_indices) != len(indices):
             print(f"Warning: {len(indices) - len(valid_indices)} exact match subset indices out of bounds ignored.")
             if len(valid_indices) == 0: return float('nan')
-            indices_tensor = valid_indices # Use only valid indices
+            indices_tensor = valid_indices
 
-        # Get binary predictions and labels for the subset
         predictions_binary_subset = (prob_scores[:, indices_tensor] >= threshold).int()
         labels_binary_subset = labels[:, indices_tensor].int()
 
-        # Compare each row (instance) within the subset for exact match
         matches_subset = torch.all(predictions_binary_subset == labels_binary_subset, dim=1)
-
-        # Calculate the ratio of matching instances (over the subset)
         exact_match_ratio_subset = matches_subset.float().mean().item()
         return exact_match_ratio_subset
-
-    # --- Public Static Methods for Exact Match Accuracy ---
 
     @staticmethod
     def compute_exact_match_accuracy_components(
@@ -401,21 +750,17 @@ class Metrics:
         accuracy_threshold: float = 0.5
     ) -> Optional[Dict[str, float]]:
         """
-        Computes exact match accuracy overall, and separately for the privileged
-        and non-privileged label subsets.
+        Computes exact match accuracy overall, privileged subset, and non-privileged subset.
 
         Args:
-            prob_scores: Predicted probabilities. Shape (b, c).
-            labels: Ground truth labels. Shape (b, c). Assumed on the same device.
-            privileged_indices: List of indices for group P.
-            non_privileged_indices: List of indices for group P_bar.
-            accuracy_threshold: Threshold for converting probabilities to binary predictions.
-
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            privileged_indices (List[int]): Privileged label indices.
+            non_privileged_indices (List[int]): Non-privileged label indices.
+            accuracy_threshold (float): Threshold for binary predictions.
 
         Returns:
-            exact_match_acc_components (Dict[str, float] or None): Dictionary containing
-             'exact_match_acc', 'exact_match_acc_privileged', 'exact_match_acc_non_privileged'.
-             Returns None if labels is None.
+            Optional[Dict[str, float]]: Dictionary with exact match accuracy components or None.
         """
         if labels is None:
             return None
@@ -423,38 +768,34 @@ class Metrics:
         device = prob_scores.device
         exact_match_components = {}
 
-        # Calculate overall exact match accuracy
         exact_match_components["em"] = Metrics._compute_exact_match_accuracy(
             prob_scores, labels, accuracy_threshold
         )
-        # Calculate exact match accuracy considering only privileged labels
         exact_match_components["em_privileged"] = Metrics._compute_exact_match_accuracy_subset(
             prob_scores, labels, privileged_indices, accuracy_threshold, device
         )
-        # Calculate exact match accuracy considering only non-privileged labels
         exact_match_components["em_non_privileged"] = Metrics._compute_exact_match_accuracy_subset(
             prob_scores, labels, non_privileged_indices, accuracy_threshold, device
         )
 
         return exact_match_components
-    
+
     @staticmethod
     def _compute_ap_single_label(
         y_true_single: np.ndarray,
         y_pred_single: np.ndarray
     ) -> float:
         """
-        (Helper) Computes Average Precision for a single label.
+        Computes Average Precision (AP) for a single label.
 
         Args:
-            y_true_single: Numpy array of ground truth labels (0 or 1) for one label.
-            y_pred_single: Numpy array of predicted scores/probabilities for one label.
+            y_true_single (np.ndarray): Ground truth binary labels for a single class.
+            y_pred_single (np.ndarray): Predicted scores for the same class.
 
         Returns:
-            Average Precision score, or NaN if no positive labels exist in y_true_single.
+            float: Average precision score or NaN if no positives.
         """
         if y_true_single.shape != y_pred_single.shape:
-            # Log warning or raise error - consistency check
             print(f"Warning: Shape mismatch in _compute_ap_single_label ({y_true_single.shape} vs {y_pred_single.shape})")
             return np.nan
         if len(y_true_single.shape) != 1:
@@ -462,7 +803,7 @@ class Metrics:
              return np.nan
 
         if np.sum(y_true_single) == 0:
-            return np.nan # AP undefined if no true positives
+            return np.nan
 
         ap = average_precision_score(y_true_single, y_pred_single)
         return float(ap)
@@ -473,15 +814,14 @@ class Metrics:
         labels: torch.Tensor
     ) -> float:
         """
-        (Internal Helper) Computes overall Mean Average Precision (mAP) across all labels.
-        Mirrors _compute_accuracy structure.
+        Computes mean Average Precision (mAP) across all labels.
 
         Args:
-            prob_scores: Predicted probabilities. Shape (b, c).
-            labels: Ground truth labels. Shape (b, c).
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
 
         Returns:
-            Overall mAP score (float). Returns NaN if mAP cannot be computed for any label.
+            float: Mean Average Precision.
         """
         if prob_scores.numel() == 0 or labels.numel() == 0:
             return float('nan')
@@ -497,7 +837,7 @@ class Metrics:
 
         for i in range(num_labels):
             ap = Metrics._compute_ap_single_label(y_true_np[:, i], y_pred_np[:, i])
-            if not np.isnan(ap): # Only average valid AP scores
+            if not np.isnan(ap):
                 ap_scores.append(ap)
 
         if not ap_scores:
@@ -513,18 +853,16 @@ class Metrics:
         device: torch.device
     ) -> float:
         """
-        (Internal Helper) Computes mAP specifically for a subset of labels.
-        Mirrors _compute_accuracy_subset structure.
+        Computes mAP for a subset of labels.
 
         Args:
-            prob_scores: Predicted probabilities. Shape (b, c).
-            labels: Ground truth labels. Shape (b, c).
-            indices: List of indices for the subset.
-            device: The torch device (used for index validation).
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            indices (List[int]): Indices of labels for the subset.
+            device (torch.device): Torch device.
 
         Returns:
-            mAP score for the subset (float). Returns NaN if indices are invalid/empty
-            or mAP cannot be computed for any label in the subset.
+            float: mAP score for the subset.
         """
         if not indices:
             return float('nan')
@@ -539,11 +877,8 @@ class Metrics:
         scores_subset = prob_scores[:, indices_tensor]
         labels_subset = labels[:, indices_tensor]
 
-        # Calculate mAP using the general _compute_map method on the subset
         map_subset = Metrics._compute_map(scores_subset, labels_subset)
         return map_subset
-
-    # --- Public Static Method for mAP Components ---
 
     @staticmethod
     def compute_map_components(
@@ -553,29 +888,24 @@ class Metrics:
         non_privileged_indices: List[int]
     ) -> Optional[Dict[str, float]]:
         """
-        Computes mAP overall, for the privileged subset, and for the non-privileged subset.
-        Mirrors compute_accuracy_components structure.
+        Computes mAP overall, privileged subset, and non-privileged subset.
 
         Args:
-            prob_scores: Predicted probabilities. Shape (b, c).
-            labels: Ground truth labels. Shape (b, c). Assumed on the same device.
-            privileged_indices: List of indices for group P.
-            non_privileged_indices: List of indices for group P_bar.
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            privileged_indices (List[int]): Privileged label indices.
+            non_privileged_indices (List[int]): Non-privileged label indices.
 
         Returns:
-            map_components (Dict[str, float] or None): Dictionary containing 'mAP',
-             'mAP_privileged', 'mAP_non_privileged'. Returns None if labels is None.
+            Optional[Dict[str, float]]: Dictionary of mAP components or None.
         """
         if labels is None:
             return None
 
-        device = prob_scores.device # Get device from input tensor
+        device = prob_scores.device
         map_components = {}
 
-        # Call internal helpers
-        map_components["mAP"] = Metrics._compute_map(
-            prob_scores, labels
-        )
+        map_components["mAP"] = Metrics._compute_map(prob_scores, labels)
         map_components["mAP_privileged"] = Metrics._compute_map_subset(
             prob_scores, labels, privileged_indices, device
         )
@@ -584,34 +914,33 @@ class Metrics:
         )
 
         return map_components
-    
+
     @staticmethod
     def _compute_f1(
         prob_scores: torch.Tensor,
         labels: torch.Tensor,
         threshold: float,
-        average_mode: str = 'samples', # Use 'samples' for Sample-Based F1
+        average_mode: str = 'samples',
         zero_division: Union[str, int] = 0
     ) -> float:
         """
-        (Internal Helper) Computes F1 score using the specified averaging method ('samples').
+        Computes sample-based F1 score.
 
         Args:
-            prob_scores: Predicted probabilities. Shape (b, c).
-            labels: Ground truth labels. Shape (b, c).
-            threshold: Threshold for converting probabilities to binary predictions.
-            average_mode: Averaging mode for f1_score ('samples').
-            zero_division: Value for F1 when P+R=0.
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            threshold (float): Threshold to binarize predictions.
+            average_mode (str): Averaging mode for sklearn f1_score.
+            zero_division (str or int): Value to use when there is zero division.
 
         Returns:
-            F1 score (float). Returns NaN on error or invalid input.
+            float: F1 score.
         """
         if prob_scores.numel() == 0 or labels.numel() == 0: return float('nan')
         if prob_scores.shape != labels.shape:
             print("Warning: Shape mismatch between scores and labels for F1 calculation.")
             return float('nan')
 
-        # Get binary predictions
         y_pred_binary_np = (prob_scores.detach().cpu().numpy() >= threshold).astype(int)
         y_true_np = labels.detach().cpu().numpy().astype(int)
 
@@ -625,24 +954,23 @@ class Metrics:
         indices: List[int],
         threshold: float,
         device: torch.device,
-        average_mode: str = 'samples', 
+        average_mode: str = 'samples',
         zero_division: Union[str, int] = 0
     ) -> float:
         """
-        (Internal Helper) Computes Sample-Based F1 score specifically for a subset of labels.
-        Uses sklearn f1_score with average='samples' on the subset.
+        Computes sample-based F1 score on a subset of labels.
 
         Args:
-            prob_scores: Predicted probabilities. Shape (b, c).
-            labels: Ground truth labels. Shape (b, c).
-            indices: List of indices defining the label subset.
-            threshold: Classification threshold.
-            device: The torch device (used for index validation).
-            average_mode: Averaging mode ('samples').
-            zero_division: Value for F1 when P+R=0.
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            indices (List[int]): Label indices subset.
+            threshold (float): Threshold to binarize predictions.
+            device (torch.device): Torch device.
+            average_mode (str): Averaging mode for sklearn f1_score.
+            zero_division (str or int): Value to use when there is zero division.
 
         Returns:
-            Sample-Based F1 score for the subset (float). Returns NaN if indices are invalid/empty.
+            float: F1 score on subset.
         """
         if not indices: return float('nan')
         indices_tensor = torch.tensor(indices, device=device, dtype=torch.long)
@@ -652,15 +980,11 @@ class Metrics:
             if len(valid_indices) == 0: return float('nan')
             indices_tensor = valid_indices
 
-        # Slice the TENSORS first
         scores_subset = prob_scores[:, indices_tensor]
         labels_subset = labels[:, indices_tensor]
 
-        # Calculate Sample-Based F1 using the general _compute_f1 method on the subset tensors
         f1_subset = Metrics._compute_f1(scores_subset, labels_subset, threshold, average_mode=average_mode, zero_division=zero_division)
         return f1_subset
-
-    # --- Public Static Method for F1 Components ---
 
     @staticmethod
     def compute_f1_components(
@@ -671,30 +995,25 @@ class Metrics:
         threshold: float = 0.5
     ) -> Optional[Dict[str, float]]:
         """
-        Computes Sample-Based F1 score (overall average instance F1) and the
-        average instance F1 calculated over privileged and non-privileged label subsets,
-        using sklearn.metrics.f1_score(average='samples').
+        Computes overall, privileged, and non-privileged sample-based F1 scores.
 
         Args:
-            prob_scores: Predicted probabilities. Shape (b, c).
-            labels: Ground truth labels. Shape (b, c). Assumed on the same device.
-            privileged_indices: List of indices for group P.
-            non_privileged_indices: List of indices for group P_bar.
-            threshold: Threshold for converting probabilities to binary predictions.
+            prob_scores (torch.Tensor): Predicted probabilities.
+            labels (torch.Tensor): Ground truth labels.
+            privileged_indices (List[int]): Privileged label indices.
+            non_privileged_indices (List[int]): Non-privileged label indices.
+            threshold (float): Threshold for binary predictions.
 
         Returns:
-            f1_components (Dict[str, float] or None): Dictionary containing
-             'f1' (overall sample-based F1), 'f1_privileged', 'f1_non_privileged'.
-             Returns None if labels is None.
+            Optional[Dict[str, float]]: Dictionary with F1 components or None if labels are None.
         """
         if labels is None:
             return None
 
-        device = prob_scores.device # Get device from input tensor
+        device = prob_scores.device
         f1_components = {}
-        avg_mode = 'samples' # Specify sample-based averaging
+        avg_mode = 'samples'
 
-        # Call internal helpers for sample-based F1
         f1_components["f1"] = Metrics._compute_f1(
             prob_scores, labels, threshold, average_mode=avg_mode
         )

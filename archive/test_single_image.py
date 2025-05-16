@@ -13,7 +13,7 @@ from PIL import Image
 from transformers import AutoFeatureExtractor # To preprocess the image
 
 # Assuming models.py and dataset.py are in the same directory or accessible via PYTHONPATH
-from models import VisionModelForCLS
+from archive.models import VisionModelForCLS
 # We still need COCODatasetOnDemand temporarily to get label names
 from dataset import COCODatasetOnDemand
 

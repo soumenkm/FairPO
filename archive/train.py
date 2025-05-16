@@ -15,7 +15,7 @@ if __name__ == "__main__":
     os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 # Import necessary components from other files
-from models import VisionModelForCLS 
+from archive.models import VisionModelForCLS 
 # Use the OnDemand version for memory efficiency
 from dataset import COCODatasetOnDemand, collate_fn_skip_none 
 

@@ -16,7 +16,7 @@ if __name__ == "__main__":
     os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 # Assuming models.py and dataset.py are in the same directory or accessible via PYTHONPATH
-from models import VisionModelForCLS
+from archive.models import VisionModelForCLS
 from dataset import COCODatasetOnDemand, collate_fn_skip_none # Use OnDemand and collate_fn
 
 # Setup basic logging
@@ -313,8 +313,8 @@ def main():
     parser = argparse.ArgumentParser(description="Test FairPO/SFT Model for Multi-Label Classification")
 
     # --- Determine User Dir (as before) ---
-    if "raid" in str(Path.cwd()).lower(): user_dir = "/raid/speech/soumen"
-    elif "home" in str(Path.cwd()).lower(): user_dir = "/home/soumen"
+    if "raid" in str(Path.cwd()).lower(): user_dir = "/raid/speech/user"
+    elif "home" in str(Path.cwd()).lower(): user_dir = "/home/user"
     else: user_dir = "."; logging.warning(f"Defaulting user_dir to '.'")
     default_coco_root = f"{user_dir}/.cache/kagglehub/datasets/jeffaudi/coco-2014-dataset-for-yolov3/versions/4/coco2014"
 

@@ -15,7 +15,7 @@ if __name__ == "__main__": # Commented out for execution in interactive env
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # Import necessary components from other files
-from models import VisionModelForCLS # Assuming models.py is in the same directory
+from archive.models import VisionModelForCLS # Assuming models.py is in the same directory
 # Use the OnDemand version for memory efficiency
 from dataset import COCODatasetOnDemand, collate_fn_skip_none # Assuming dataset.py is in the same directory
 
